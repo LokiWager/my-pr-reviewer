@@ -1,0 +1,67 @@
+name: PRReviewer
+options:
+  minimumXcodeGenVersion: 2.38.0
+configs:
+  Debug: debug
+  Release: release
+settings:
+  base:
+    SWIFT_VERSION: 5.10
+    MACOSX_DEPLOYMENT_TARGET: "14.0"
+targets:
+  PRReviewerCore:
+    type: library.static
+    platform: macOS
+    sources:
+      - Sources/Core
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.codex.prreviewer.core
+        DEFINES_MODULE: YES
+        SKIP_INSTALL: YES
+        CODE_SIGNING_ALLOWED: NO
+
+  PRReviewerAgent:
+    type: tool
+    platform: macOS
+    sources:
+      - Sources/Agent
+    dependencies:
+      - target: PRReviewerCore
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.codex.prreviewer.agent
+
+  PRReviewerWidget:
+    type: app-extension
+    platform: macOS
+    sources:
+      - Sources/Widget
+    dependencies:
+      - target: PRReviewerCore
+    entitlements:
+      path: Config/PRReviewerWidget.entitlements
+    info:
+      path: Config/PRReviewerWidget-Info.plist
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.codex.prreviewer.widget
+
+  PRReviewerApp:
+    type: application
+    platform: macOS
+    sources:
+      - Sources/App
+    dependencies:
+      - target: PRReviewerCore
+      - target: PRReviewerWidget
+        embed: true
+    entitlements:
+      path: Config/PRReviewer.entitlements
+    info:
+      path: Config/PRReviewer-Info.plist
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.codex.prreviewer
+        INFOPLIST_KEY_LSApplicationCategoryType: public.app-category.developer-tools
+        INFOPLIST_KEY_NSPrincipalClass: NSApplication
