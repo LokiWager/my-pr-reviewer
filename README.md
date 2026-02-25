@@ -1,57 +1,57 @@
 # PRReviewer (macOS App + Widget)
 
-每天定时执行：拉取指定仓库最新代码，检测是否有新增 PR（相对上次执行），对新增 PR 调用 Codex review，然后自动修复并推送；同时在 macOS App 与 Widget 展示进度和报告。
+Runs on a daily schedule: pulls the latest code from a target repository, detects newly added PRs (compared with the previous run), calls Codex review for new PRs, then auto-fixes and pushes changes. Progress and reports are shown in both the macOS app and widget.
 
-## 功能
+## Features
 
-- 每日固定时间后台执行（`launchd`）
-- 检测新增 PR（使用本地状态文件 `processedPRNumbers`）
-- 调用可配置命令模板执行 `review` / `fix`
-- 可配置并发（多 PR 并行处理）与命令失败重试
-- 自动 `commit` + `push`（可关闭）
-- App 显示进度、日志、报告
-- Widget 展示当前进度和结果
+- Scheduled daily background execution (`launchd`)
+- New PR detection (using local state file `processedPRNumbers`)
+- Configurable command templates for `review` / `fix`
+- Configurable concurrency (multiple PRs in parallel) and command retry handling
+- Automatic `commit` + `push` (can be disabled)
+- App dashboard for progress, logs, and reports
+- Widget status and result display
 
-## 技术结构
+## Architecture
 
-- `PRReviewerCore`：核心执行引擎、状态存储、命令执行器、launchd 安装器
-- `PRReviewerAgent`：CLI 入口（后台任务执行）
-- `PRReviewerApp`：SwiftUI 桌面界面（Dashboard + Settings）
-- `PRReviewerWidget`：WidgetKit 进度展示
+- `PRReviewerCore`: execution engine, state storage, command runner, `launchd` installer
+- `PRReviewerAgent`: CLI entry point for background tasks
+- `PRReviewerApp`: SwiftUI desktop UI (Dashboard + Settings)
+- `PRReviewerWidget`: WidgetKit progress display
 
-## 前置依赖
+## Prerequisites
 
 - macOS 14+
 - Xcode 15+
 - [XcodeGen](https://github.com/yonaskolb/XcodeGen)
-- `git`, `gh`, `codex`（都需可在 shell 中执行）
-- `gh auth login` 完成授权
+- `git`, `gh`, `codex` (all must be available in your shell)
+- Authenticated GitHub CLI (`gh auth login`)
 
-## 快速开始
+## Quick Start
 
-1. 生成 Xcode 项目
+1. Generate the Xcode project.
 
 ```bash
 xcodegen generate
 ```
 
-2. 打开项目
+2. Open the project.
 
 ```bash
 open PRReviewer.xcodeproj
 ```
 
-3. 首次运行 App，填写 Settings：
-- `Repo Path`：要自动审查的仓库路径
-- `Default Branch`：例如 `main`
-- `Max concurrent PR workers`：并行 worker 数（建议先从 `1` 或 `2` 开始）
-- `Command retries` / `Retry delay seconds`：review/fix/push 失败后的重试策略
+3. On first app launch, fill in Settings:
+- `Repo Path`: repository path to review automatically
+- `Default Branch`: e.g. `main`
+- `Max concurrent PR workers`: number of parallel workers (start with `1` or `2`)
+- `Command retries` / `Retry delay seconds`: retry policy for review/fix/push failures
 - `Review Command Template` / `Fix Command Template`
-- `Agent Executable Path`：`PRReviewerAgent` 可执行文件绝对路径
+- `Agent Executable Path`: absolute path to the `PRReviewerAgent` executable
 
-4. 在 App 里点击 `Save`，然后 `Install Daily Task`。
+4. In the app, click `Save`, then `Install Daily Task`.
 
-## 命令模板占位符
+## Command Template Placeholders
 
 - `{{PR_NUMBER}}`
 - `{{PR_TITLE}}`
@@ -62,21 +62,21 @@ open PRReviewer.xcodeproj
 - `{{WORK_DIR}}`
 - `{{REPORT_PATH}}`
 
-示例：
+Example:
 
 ```bash
 codex review --pr {{PR_NUMBER}} --repo {{REPO_PATH}} > {{REPORT_PATH}}
 codex fix --pr {{PR_NUMBER}} --repo {{REPO_PATH}}
 ```
 
-说明：
+Notes:
 
-- 并发模式下，每个 PR 在独立临时目录执行，不会互相污染工作区。
-- `{{REPO_PATH}}` 和 `{{WORK_DIR}}` 都指向当前 PR 的临时工作目录。
+- In concurrent mode, each PR runs in its own temporary directory to avoid workspace conflicts.
+- `{{REPO_PATH}}` and `{{WORK_DIR}}` both point to the current PR's temporary working directory.
 
-## 手动调度脚本
+## Manual Scheduling Script
 
-也可以不用 App 安装任务，直接执行：
+You can install the task without using the app by running:
 
 ```bash
 ./Scripts/install_launch_agent.sh \
@@ -85,9 +85,9 @@ codex fix --pr {{PR_NUMBER}} --repo {{REPO_PATH}}
   9 0
 ```
 
-## 数据路径
+## Data Paths
 
-优先 App Group 容器，fallback 为：
+The app group container is preferred. Fallback paths:
 
 - `~/.pr-reviewer/settings.json`
 - `~/.pr-reviewer/engine-state.json`
@@ -95,6 +95,6 @@ codex fix --pr {{PR_NUMBER}} --repo {{REPO_PATH}}
 - `~/.pr-reviewer/reports/*.md`
 - `~/.pr-reviewer/logs/*.log`
 
-## 风险提示
+## Risk Notice
 
-自动修复并推送是高风险操作，建议先在测试仓库验证命令模板和权限，再用于生产仓库。
+Automatic fixing and pushing is a high-risk operation. Validate command templates and permissions in a test repository before using it in production repositories.
