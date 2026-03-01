@@ -1,5 +1,6 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -81,6 +82,7 @@ impl Default for AppSettings {
 pub struct EngineState {
     pub processed_pr_numbers: Vec<u64>,
     pub last_run_at: Option<DateTime<Utc>>,
+    pub monthly_fixed_pr_numbers_by_month: HashMap<String, Vec<u64>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

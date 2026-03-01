@@ -21,7 +21,7 @@ Then edit:
 
 Required fields:
 - `repo_path`
-- `repo_clone_url` (用于首次自动 clone)
+- `repo_clone_url` (used for first-time auto clone)
 - `default_branch`
 - `review_command_template`
 - `fix_command_template`

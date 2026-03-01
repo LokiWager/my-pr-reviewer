@@ -1,12 +1,14 @@
 use anyhow::anyhow;
-use chrono::Utc;
+use chrono::{Local, Utc};
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::process::{Command, Stdio};
+use std::collections::HashSet;
 use std::sync::mpsc;
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
-use crate::models::OpenPr;
+use crate::models::{EngineState, OpenPr};
 
 #[derive(Debug, Clone)]
 pub struct CommandResult {
@@ -37,6 +39,80 @@ impl std::fmt::Display for ExecError {
 
 impl std::error::Error for ExecError {}
 
+#[derive(Debug, Clone)]
+struct MonthlyFixCounter {
+    month_key: String,
+    pr_numbers: HashSet<u64>,
+}
+
+impl MonthlyFixCounter {
+    fn empty_for_current_month() -> Self {
+        Self {
+            month_key: current_month_key(),
+            pr_numbers: HashSet::new(),
+        }
+    }
+
+    fn rotate_if_needed(&mut self) {
+        let now_key = current_month_key();
+        if self.month_key != now_key {
+            self.month_key = now_key;
+            self.pr_numbers.clear();
+        }
+    }
+}
+
+fn current_month_key() -> String {
+    Local::now().format("%Y-%m").to_string()
+}
+
+fn monthly_fix_counter() -> &'static Mutex<MonthlyFixCounter> {
+    static COUNTER: OnceLock<Mutex<MonthlyFixCounter>> = OnceLock::new();
+    COUNTER.get_or_init(|| Mutex::new(MonthlyFixCounter::empty_for_current_month()))
+}
+
+pub fn initialize_monthly_fix_counter(state: &EngineState) {
+    let month_key = current_month_key();
+    let pr_numbers = state
+        .monthly_fixed_pr_numbers_by_month
+        .get(&month_key)
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .collect::<HashSet<_>>();
+    if let Ok(mut counter) = monthly_fix_counter().lock() {
+        counter.month_key = month_key;
+        counter.pr_numbers = pr_numbers;
+    }
+}
+
+pub fn monthly_fixed_pr_count() -> usize {
+    if let Ok(mut counter) = monthly_fix_counter().lock() {
+        counter.rotate_if_needed();
+        return counter.pr_numbers.len();
+    }
+    0
+}
+
+pub fn record_monthly_fixed_pr(pr_number: u64) -> bool {
+    if let Ok(mut counter) = monthly_fix_counter().lock() {
+        counter.rotate_if_needed();
+        return counter.pr_numbers.insert(pr_number);
+    }
+    false
+}
+
+pub fn sync_monthly_fix_counter_into_state(state: &mut EngineState) {
+    if let Ok(mut counter) = monthly_fix_counter().lock() {
+        counter.rotate_if_needed();
+        let mut prs: Vec<u64> = counter.pr_numbers.iter().copied().collect();
+        prs.sort_unstable();
+        state
+            .monthly_fixed_pr_numbers_by_month
+            .insert(counter.month_key.clone(), prs);
+    }
+}
+
 pub fn sh_quote(input: &str) -> String {
     format!("'{}'", input.replace('\'', "'\\''"))
 }
@@ -56,6 +132,11 @@ pub fn run_shell_internal(
     stream_output: bool,
     stream_prefix: Option<&str>,
 ) -> std::result::Result<CommandResult, ExecError> {
+    println!(
+        "Calendar-month fixed PR count: {}",
+        monthly_fixed_pr_count()
+    );
+
     let mut cmd = Command::new("/bin/zsh");
     cmd.arg("-lc").arg(command);
     if let Some(dir) = cwd {

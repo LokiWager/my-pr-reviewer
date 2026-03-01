@@ -125,10 +125,30 @@ public struct AppSettings: Codable {
 public struct EngineState: Codable {
     public var processedPRNumbers: [Int]
     public var lastRunAt: Date?
+    public var monthlyFixedPRNumbersByMonth: [String: [Int]]
 
-    public init(processedPRNumbers: [Int] = [], lastRunAt: Date? = nil) {
+    public init(
+        processedPRNumbers: [Int] = [],
+        lastRunAt: Date? = nil,
+        monthlyFixedPRNumbersByMonth: [String: [Int]] = [:]
+    ) {
         self.processedPRNumbers = processedPRNumbers
         self.lastRunAt = lastRunAt
+        self.monthlyFixedPRNumbersByMonth = monthlyFixedPRNumbersByMonth
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case processedPRNumbers
+        case lastRunAt
+        case monthlyFixedPRNumbersByMonth
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.processedPRNumbers = try container.decodeIfPresent([Int].self, forKey: .processedPRNumbers) ?? []
+        self.lastRunAt = try container.decodeIfPresent(Date.self, forKey: .lastRunAt)
+        self.monthlyFixedPRNumbersByMonth =
+            try container.decodeIfPresent([String: [Int]].self, forKey: .monthlyFixedPRNumbersByMonth) ?? [:]
     }
 }
 

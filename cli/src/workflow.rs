@@ -6,11 +6,12 @@ use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use crate::models::{
-    AppSettings, ExecutionStage, OpenPr, PrExecutionResult, RunSnapshot, RunStatus,
+    AppSettings, EngineState, ExecutionStage, OpenPr, PrExecutionResult, RunSnapshot, RunStatus,
 };
 use crate::shell::{
-    commit_and_push_if_needed, is_codex_review_prompt_conflict, render_exec_error, run_shell,
-    run_with_retry, run_with_retry_streaming, sh_quote,
+    commit_and_push_if_needed, initialize_monthly_fix_counter, is_codex_review_prompt_conflict,
+    record_monthly_fixed_pr, render_exec_error, run_shell, run_with_retry,
+    run_with_retry_streaming, sh_quote, sync_monthly_fix_counter_into_state,
 };
 use crate::store::{
     StorePaths, load_engine_state, load_settings, load_snapshot, save_engine_state, save_snapshot,
@@ -263,6 +264,9 @@ fn fetch_open_prs_with_state(
     paths: &StorePaths,
     sync: bool,
 ) -> Result<(AppSettings, Vec<OpenPr>, HashSet<u64>)> {
+    let state = load_engine_state(paths)?;
+    initialize_monthly_fix_counter(&state);
+
     let settings = load_settings(paths)?;
     validate_command_templates(&settings)?;
     validate_required_commands()?;
@@ -274,7 +278,6 @@ fn fetch_open_prs_with_state(
     let mut prs = list_open_prs(&settings)?;
     prs.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
 
-    let state = load_engine_state(paths)?;
     let processed_set: HashSet<u64> = state.processed_pr_numbers.into_iter().collect();
     Ok((settings, prs, processed_set))
 }
@@ -407,6 +410,7 @@ fn execute_pr(
     paths: &StorePaths,
     settings: &AppSettings,
     pr: &OpenPr,
+    state: &mut EngineState,
     snapshot: &mut RunSnapshot,
     ordinal: usize,
     total: usize,
@@ -506,6 +510,30 @@ fn execute_pr(
         .map_err(|e| anyhow!(render_exec_error(&e)))?;
     }
 
+    if review_result.exit_code == 0 && fix_result.exit_code == 0 && pushed {
+        if record_monthly_fixed_pr(pr.number) {
+            log_step(
+                snapshot,
+                format!(
+                    "Counter updated: PR #{} counted for this calendar month",
+                    pr.number
+                ),
+                verbose,
+            );
+            sync_monthly_fix_counter_into_state(state);
+            save_engine_state(paths, state)?;
+        } else {
+            log_step(
+                snapshot,
+                format!(
+                    "Counter unchanged: PR #{} already counted this calendar month",
+                    pr.number
+                ),
+                verbose,
+            );
+        }
+    }
+
     Ok(PrExecutionResult {
         number: pr.number,
         title: pr.title.clone(),
@@ -521,6 +549,7 @@ fn execute_pr(
 pub fn run_workflow(paths: &StorePaths, verbose: bool) -> Result<RunSnapshot> {
     let settings = load_settings(paths)?;
     let mut state = load_engine_state(paths)?;
+    initialize_monthly_fix_counter(&state);
 
     let mut snapshot = RunSnapshot {
         started_at: Some(now()),
@@ -635,6 +664,7 @@ pub fn run_workflow(paths: &StorePaths, verbose: bool) -> Result<RunSnapshot> {
         snapshot.stage = ExecutionStage::Completed;
         snapshot.finished_at = Some(now());
         state.last_run_at = Some(now());
+        sync_monthly_fix_counter_into_state(&mut state);
         save_engine_state(paths, &state)?;
         log_step(&mut snapshot, "No new PRs, run finished", verbose);
         save_snapshot(paths, &snapshot)?;
@@ -649,6 +679,7 @@ pub fn run_workflow(paths: &StorePaths, verbose: bool) -> Result<RunSnapshot> {
             paths,
             &settings,
             pr,
+            &mut state,
             &mut snapshot,
             idx + 1,
             total_prs,
@@ -696,6 +727,7 @@ pub fn run_workflow(paths: &StorePaths, verbose: bool) -> Result<RunSnapshot> {
     state.processed_pr_numbers = processed_set.into_iter().collect();
     state.processed_pr_numbers.sort_unstable();
     state.last_run_at = Some(now());
+    sync_monthly_fix_counter_into_state(&mut state);
     save_engine_state(paths, &state)?;
 
     if failures > 0 {
@@ -730,6 +762,7 @@ pub fn run_single_pr_by_number(
         .ok_or_else(|| anyhow!("PR #{} is not open or not found", pr_number))?;
 
     let mut state = load_engine_state(paths)?;
+    initialize_monthly_fix_counter(&state);
     let mut snapshot = RunSnapshot {
         started_at: Some(now()),
         finished_at: None,
@@ -750,7 +783,16 @@ pub fn run_single_pr_by_number(
     );
     save_snapshot(paths, &snapshot)?;
 
-    match execute_pr(paths, &settings, &pr, &mut snapshot, 1, 1, verbose) {
+    match execute_pr(
+        paths,
+        &settings,
+        &pr,
+        &mut state,
+        &mut snapshot,
+        1,
+        1,
+        verbose,
+    ) {
         Ok(result) => {
             processed_set.insert(pr.number);
             snapshot.report.push(result);
@@ -793,6 +835,7 @@ pub fn run_single_pr_by_number(
     state.processed_pr_numbers = processed_set.into_iter().collect();
     state.processed_pr_numbers.sort_unstable();
     state.last_run_at = Some(now());
+    sync_monthly_fix_counter_into_state(&mut state);
     save_engine_state(paths, &state)?;
 
     snapshot.finished_at = Some(now());

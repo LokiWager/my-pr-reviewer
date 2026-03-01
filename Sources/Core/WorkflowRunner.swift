@@ -6,6 +6,47 @@ private struct PRProcessOutcome {
     let logLines: [String]
 }
 
+private final class MonthlyFixTracker {
+    private let lock = NSLock()
+    private let monthKey: String
+    private var fixedPRNumbers: Set<Int>
+
+    init(state: EngineState, now: Date = Date()) {
+        self.monthKey = Self.makeMonthKey(from: now)
+        self.fixedPRNumbers = Set(state.monthlyFixedPRNumbersByMonth[self.monthKey] ?? [])
+    }
+
+    static func makeMonthKey(from date: Date) -> String {
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = .current
+        let components = calendar.dateComponents([.year, .month], from: date)
+        let year = components.year ?? 1970
+        let month = components.month ?? 1
+        return String(format: "%04d-%02d", year, month)
+    }
+
+    func count() -> Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return fixedPRNumbers.count
+    }
+
+    @discardableResult
+    func recordFix(prNumber: Int) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        let before = fixedPRNumbers.count
+        fixedPRNumbers.insert(prNumber)
+        return fixedPRNumbers.count != before
+    }
+
+    func apply(to state: inout EngineState) {
+        lock.lock()
+        state.monthlyFixedPRNumbersByMonth[monthKey] = Array(fixedPRNumbers).sorted()
+        lock.unlock()
+    }
+}
+
 public final class WorkflowRunner {
     private let isoFormatter = ISO8601DateFormatter()
 
@@ -27,18 +68,37 @@ public final class WorkflowRunner {
             guard !settings.repoPath.isEmpty else {
                 throw NSError(domain: "PRReviewer", code: 2, userInfo: [NSLocalizedDescriptionKey: "repoPath is empty in settings"])
             }
+            var state = SharedStore.loadState()
+            let monthlyFixTracker = MonthlyFixTracker(state: state)
+
+            func commandLog(_ message: String) {
+                appendLog(message, to: &snapshot)
+                persist(snapshot)
+            }
 
             appendLog("Start run", to: &snapshot)
             persist(snapshot)
 
-            try validateEnvironment(repoPath: settings.repoPath)
-            try syncRepository(settings: settings, snapshot: &snapshot)
+            try validateEnvironment(
+                repoPath: settings.repoPath,
+                monthlyFixTracker: monthlyFixTracker,
+                commandLog: commandLog
+            )
+            try syncRepository(
+                settings: settings,
+                monthlyFixTracker: monthlyFixTracker,
+                snapshot: &snapshot,
+                commandLog: commandLog
+            )
 
             snapshot.stage = .loadingPRs
             persist(snapshot)
 
-            let openPRs = try listOpenPRs(repoPath: settings.repoPath)
-            var state = SharedStore.loadState()
+            let openPRs = try listOpenPRs(
+                repoPath: settings.repoPath,
+                monthlyFixTracker: monthlyFixTracker,
+                commandLog: commandLog
+            )
             var processedSet = Set(state.processedPRNumbers)
 
             var newPRs = openPRs.filter { !processedSet.contains($0.number) }
@@ -58,12 +118,17 @@ public final class WorkflowRunner {
                 snapshot.status = .succeeded
                 snapshot.finishedAt = Date()
                 state.lastRunAt = Date()
+                monthlyFixTracker.apply(to: &state)
                 try SharedStore.saveState(state)
                 persist(snapshot)
                 return snapshot
             }
 
-            let originURL = try remoteOriginURL(repoPath: settings.repoPath)
+            let originURL = try remoteOriginURL(
+                repoPath: settings.repoPath,
+                monthlyFixTracker: monthlyFixTracker,
+                commandLog: commandLog
+            )
             let runID = isoFormatter.string(from: Date()).replacingOccurrences(of: ":", with: "-")
             let runRoot = FileManager.default.temporaryDirectory
                 .appendingPathComponent("prreviewer-runs", isDirectory: true)
@@ -101,7 +166,8 @@ public final class WorkflowRunner {
                         settings: settings,
                         originURL: originURL,
                         runRoot: runRoot,
-                        runID: runID
+                        runID: runID,
+                        monthlyFixTracker: monthlyFixTracker
                     )
 
                     lock.lock()
@@ -131,6 +197,7 @@ public final class WorkflowRunner {
             processedSet.formUnion(newlyProcessed)
             state.processedPRNumbers = Array(processedSet).sorted()
             state.lastRunAt = Date()
+            monthlyFixTracker.apply(to: &state)
             try SharedStore.saveState(state)
 
             snapshot.report = results.sorted { $0.number < $1.number }
@@ -164,10 +231,28 @@ public final class WorkflowRunner {
         guard !settings.repoPath.isEmpty else {
             throw NSError(domain: "PRReviewer", code: 2, userInfo: [NSLocalizedDescriptionKey: "repoPath is empty in settings"])
         }
+        let monthlyFixTracker = MonthlyFixTracker(state: SharedStore.loadState())
 
-        try validateEnvironment(repoPath: settings.repoPath)
-        try syncRepository(repoPath: settings.repoPath, defaultBranch: settings.defaultBranch)
-        return try listOpenPRs(repoPath: settings.repoPath)
+        let commandLog: (String) -> Void = { message in
+            print(message)
+        }
+
+        try validateEnvironment(
+            repoPath: settings.repoPath,
+            monthlyFixTracker: monthlyFixTracker,
+            commandLog: commandLog
+        )
+        try syncRepository(
+            repoPath: settings.repoPath,
+            defaultBranch: settings.defaultBranch,
+            monthlyFixTracker: monthlyFixTracker,
+            commandLog: commandLog
+        )
+        return try listOpenPRs(
+            repoPath: settings.repoPath,
+            monthlyFixTracker: monthlyFixTracker,
+            commandLog: commandLog
+        )
     }
 
     @discardableResult
@@ -185,17 +270,37 @@ public final class WorkflowRunner {
             guard !settings.repoPath.isEmpty else {
                 throw NSError(domain: "PRReviewer", code: 2, userInfo: [NSLocalizedDescriptionKey: "repoPath is empty in settings"])
             }
+            var state = SharedStore.loadState()
+            let monthlyFixTracker = MonthlyFixTracker(state: state)
+
+            func commandLog(_ message: String) {
+                appendLog(message, to: &snapshot)
+                persist(snapshot)
+            }
 
             appendLog("Start selected PR run for #\(number)", to: &snapshot)
             persist(snapshot)
 
-            try validateEnvironment(repoPath: settings.repoPath)
-            try syncRepository(settings: settings, snapshot: &snapshot)
+            try validateEnvironment(
+                repoPath: settings.repoPath,
+                monthlyFixTracker: monthlyFixTracker,
+                commandLog: commandLog
+            )
+            try syncRepository(
+                settings: settings,
+                monthlyFixTracker: monthlyFixTracker,
+                snapshot: &snapshot,
+                commandLog: commandLog
+            )
 
             snapshot.stage = .loadingPRs
             persist(snapshot)
 
-            let openPRs = try listOpenPRs(repoPath: settings.repoPath)
+            let openPRs = try listOpenPRs(
+                repoPath: settings.repoPath,
+                monthlyFixTracker: monthlyFixTracker,
+                commandLog: commandLog
+            )
             guard let selectedPR = openPRs.first(where: { $0.number == number }) else {
                 throw NSError(domain: "PRReviewer", code: 10, userInfo: [NSLocalizedDescriptionKey: "PR #\(number) not found in open PR list"])
             }
@@ -209,7 +314,11 @@ public final class WorkflowRunner {
             appendLog("Selected PR #\(selectedPR.number): \(selectedPR.title)", to: &snapshot)
             persist(snapshot)
 
-            let originURL = try remoteOriginURL(repoPath: settings.repoPath)
+            let originURL = try remoteOriginURL(
+                repoPath: settings.repoPath,
+                monthlyFixTracker: monthlyFixTracker,
+                commandLog: commandLog
+            )
             let runID = isoFormatter.string(from: Date()).replacingOccurrences(of: ":", with: "-")
             let runRoot = FileManager.default.temporaryDirectory
                 .appendingPathComponent("prreviewer-runs", isDirectory: true)
@@ -227,7 +336,8 @@ public final class WorkflowRunner {
                 settings: settings,
                 originURL: originURL,
                 runRoot: runRoot,
-                runID: runID
+                runID: runID,
+                monthlyFixTracker: monthlyFixTracker
             )
 
             snapshot.currentIndex = 1
@@ -237,13 +347,13 @@ public final class WorkflowRunner {
             snapshot.logLines.append(contentsOf: outcome.logLines)
             trimLogLines(&snapshot)
 
-            var state = SharedStore.loadState()
             state.lastRunAt = Date()
             if outcome.markAsProcessed {
                 var processedSet = Set(state.processedPRNumbers)
                 processedSet.insert(selectedPR.number)
                 state.processedPRNumbers = Array(processedSet).sorted()
             }
+            monthlyFixTracker.apply(to: &state)
             try SharedStore.saveState(state)
 
             snapshot.finishedAt = Date()
@@ -276,7 +386,8 @@ public final class WorkflowRunner {
         settings: AppSettings,
         originURL: String,
         runRoot: URL,
-        runID: String
+        runID: String,
+        monthlyFixTracker: MonthlyFixTracker
     ) -> PRProcessOutcome {
         var logs: [String] = []
 
@@ -304,7 +415,9 @@ public final class WorkflowRunner {
                 currentDirectory: nil,
                 retries: settings.maxCommandRetries,
                 retryDelaySeconds: settings.retryDelaySeconds,
-                stepName: "clone"
+                stepName: "clone",
+                monthlyFixTracker: monthlyFixTracker,
+                commandLog: log
             )
 
             log("Checkout PR")
@@ -313,7 +426,9 @@ public final class WorkflowRunner {
                 currentDirectory: workDir.path,
                 retries: settings.maxCommandRetries,
                 retryDelaySeconds: settings.retryDelaySeconds,
-                stepName: "checkout"
+                stepName: "checkout",
+                monthlyFixTracker: monthlyFixTracker,
+                commandLog: log
             )
 
             let reviewCommand = expand(
@@ -330,7 +445,9 @@ public final class WorkflowRunner {
                 currentDirectory: workDir.path,
                 retries: settings.maxCommandRetries,
                 retryDelaySeconds: settings.retryDelaySeconds,
-                stepName: "review"
+                stepName: "review",
+                monthlyFixTracker: monthlyFixTracker,
+                commandLog: log
             )
             reviewExitCode = Int(reviewResult.exitCode)
             try writeReviewArtifact(pr: pr, command: reviewCommand, result: reviewResult, reportURL: reportURL)
@@ -349,7 +466,9 @@ public final class WorkflowRunner {
                 currentDirectory: workDir.path,
                 retries: settings.maxCommandRetries,
                 retryDelaySeconds: settings.retryDelaySeconds,
-                stepName: "fix"
+                stepName: "fix",
+                monthlyFixTracker: monthlyFixTracker,
+                commandLog: log
             )
             fixExitCode = Int(fixResult.exitCode)
 
@@ -359,8 +478,18 @@ public final class WorkflowRunner {
                     pr: pr,
                     repoPath: workDir.path,
                     retries: settings.maxCommandRetries,
-                    retryDelaySeconds: settings.retryDelaySeconds
+                    retryDelaySeconds: settings.retryDelaySeconds,
+                    monthlyFixTracker: monthlyFixTracker,
+                    commandLog: log
                 )
+            }
+
+            if reviewExitCode == 0, fixExitCode == 0, pushed {
+                if monthlyFixTracker.recordFix(prNumber: pr.number) {
+                    log("Counter updated: PR #\(pr.number) counted for this calendar month")
+                } else {
+                    log("Counter unchanged: PR #\(pr.number) already counted this calendar month")
+                }
             }
 
             log("PR completed")
@@ -428,14 +557,22 @@ public final class WorkflowRunner {
         currentDirectory: String?,
         retries: Int,
         retryDelaySeconds: Int,
-        stepName: String
+        stepName: String,
+        monthlyFixTracker: MonthlyFixTracker,
+        commandLog: (String) -> Void
     ) throws -> CommandResult {
         let attempts = max(1, retries + 1)
         var lastError: Error?
 
         for attempt in 1...attempts {
             do {
-                return try Shell.run(command, currentDirectory: currentDirectory, failOnNonZeroExit: true)
+                return try runCommand(
+                    command,
+                    currentDirectory: currentDirectory,
+                    failOnNonZeroExit: true,
+                    monthlyFixTracker: monthlyFixTracker,
+                    commandLog: commandLog
+                )
             } catch {
                 lastError = error
                 if attempt < attempts {
@@ -455,40 +592,116 @@ public final class WorkflowRunner {
         )
     }
 
-    private func validateEnvironment(repoPath: String) throws {
-        let gitCheck = try Shell.run("git rev-parse --is-inside-work-tree", currentDirectory: repoPath)
+    private func runCommand(
+        _ command: String,
+        currentDirectory: String?,
+        failOnNonZeroExit: Bool,
+        monthlyFixTracker: MonthlyFixTracker,
+        commandLog: (String) -> Void
+    ) throws -> CommandResult {
+        commandLog("Calendar-month fixed PR count: \(monthlyFixTracker.count())")
+        return try Shell.run(
+            command,
+            currentDirectory: currentDirectory,
+            failOnNonZeroExit: failOnNonZeroExit
+        )
+    }
+
+    private func validateEnvironment(
+        repoPath: String,
+        monthlyFixTracker: MonthlyFixTracker,
+        commandLog: (String) -> Void
+    ) throws {
+        let gitCheck = try runCommand(
+            "git rev-parse --is-inside-work-tree",
+            currentDirectory: repoPath,
+            failOnNonZeroExit: false,
+            monthlyFixTracker: monthlyFixTracker,
+            commandLog: commandLog
+        )
         guard gitCheck.exitCode == 0 else {
             throw NSError(domain: "PRReviewer", code: 3, userInfo: [NSLocalizedDescriptionKey: "repoPath is not a git repository"])
         }
 
-        let ghCheck = try Shell.run("command -v gh")
+        let ghCheck = try runCommand(
+            "command -v gh",
+            currentDirectory: nil,
+            failOnNonZeroExit: false,
+            monthlyFixTracker: monthlyFixTracker,
+            commandLog: commandLog
+        )
         guard ghCheck.exitCode == 0 else {
             throw NSError(domain: "PRReviewer", code: 4, userInfo: [NSLocalizedDescriptionKey: "gh CLI not found"])
         }
 
-        let codexCheck = try Shell.run("command -v codex")
+        let codexCheck = try runCommand(
+            "command -v codex",
+            currentDirectory: nil,
+            failOnNonZeroExit: false,
+            monthlyFixTracker: monthlyFixTracker,
+            commandLog: commandLog
+        )
         guard codexCheck.exitCode == 0 else {
             throw NSError(domain: "PRReviewer", code: 5, userInfo: [NSLocalizedDescriptionKey: "codex CLI not found"])
         }
     }
 
-    private func syncRepository(settings: AppSettings, snapshot: inout RunSnapshot) throws {
+    private func syncRepository(
+        settings: AppSettings,
+        monthlyFixTracker: MonthlyFixTracker,
+        snapshot: inout RunSnapshot,
+        commandLog: (String) -> Void
+    ) throws {
         appendLog("Sync repository", to: &snapshot)
         persist(snapshot)
-        try syncRepository(repoPath: settings.repoPath, defaultBranch: settings.defaultBranch)
+        try syncRepository(
+            repoPath: settings.repoPath,
+            defaultBranch: settings.defaultBranch,
+            monthlyFixTracker: monthlyFixTracker,
+            commandLog: commandLog
+        )
     }
 
-    private func syncRepository(repoPath: String, defaultBranch: String) throws {
-        _ = try Shell.run("git fetch --all --prune", currentDirectory: repoPath, failOnNonZeroExit: true)
-        _ = try Shell.run("git checkout \(Shell.quote(defaultBranch))", currentDirectory: repoPath, failOnNonZeroExit: true)
-        _ = try Shell.run("git pull --ff-only origin \(Shell.quote(defaultBranch))", currentDirectory: repoPath, failOnNonZeroExit: true)
+    private func syncRepository(
+        repoPath: String,
+        defaultBranch: String,
+        monthlyFixTracker: MonthlyFixTracker,
+        commandLog: (String) -> Void
+    ) throws {
+        _ = try runCommand(
+            "git fetch --all --prune",
+            currentDirectory: repoPath,
+            failOnNonZeroExit: true,
+            monthlyFixTracker: monthlyFixTracker,
+            commandLog: commandLog
+        )
+        _ = try runCommand(
+            "git checkout \(Shell.quote(defaultBranch))",
+            currentDirectory: repoPath,
+            failOnNonZeroExit: true,
+            monthlyFixTracker: monthlyFixTracker,
+            commandLog: commandLog
+        )
+        _ = try runCommand(
+            "git pull --ff-only origin \(Shell.quote(defaultBranch))",
+            currentDirectory: repoPath,
+            failOnNonZeroExit: true,
+            monthlyFixTracker: monthlyFixTracker,
+            commandLog: commandLog
+        )
     }
 
-    private func remoteOriginURL(repoPath: String) throws -> String {
-        let result = try Shell.run(
+    private func remoteOriginURL(
+        repoPath: String,
+        monthlyFixTracker: MonthlyFixTracker,
+        commandLog: (String) -> Void
+    ) throws -> String {
+        let result = try runCommand(
             "git config --get remote.origin.url",
             currentDirectory: repoPath,
-            failOnNonZeroExit: true
+            failOnNonZeroExit: true,
+            monthlyFixTracker: monthlyFixTracker,
+            commandLog: commandLog
         )
         let originURL = result.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
         if originURL.isEmpty {
@@ -497,9 +710,19 @@ public final class WorkflowRunner {
         return originURL
     }
 
-    private func listOpenPRs(repoPath: String) throws -> [OpenPR] {
+    private func listOpenPRs(
+        repoPath: String,
+        monthlyFixTracker: MonthlyFixTracker,
+        commandLog: (String) -> Void
+    ) throws -> [OpenPR] {
         let command = "gh pr list --state open --limit 200 --json number,title,headRefName,url,updatedAt"
-        let result = try Shell.run(command, currentDirectory: repoPath, failOnNonZeroExit: true)
+        let result = try runCommand(
+            command,
+            currentDirectory: repoPath,
+            failOnNonZeroExit: true,
+            monthlyFixTracker: monthlyFixTracker,
+            commandLog: commandLog
+        )
         let data = Data(result.stdout.utf8)
         let prs = try JSONDecoder().decode([OpenPR].self, from: data)
         return prs.sorted { $0.updatedAt > $1.updatedAt }
@@ -509,25 +732,43 @@ public final class WorkflowRunner {
         pr: OpenPR,
         repoPath: String,
         retries: Int,
-        retryDelaySeconds: Int
+        retryDelaySeconds: Int,
+        monthlyFixTracker: MonthlyFixTracker,
+        commandLog: (String) -> Void
     ) throws -> Bool {
-        let status = try Shell.run("git status --porcelain", currentDirectory: repoPath, failOnNonZeroExit: true)
+        let status = try runCommand(
+            "git status --porcelain",
+            currentDirectory: repoPath,
+            failOnNonZeroExit: true,
+            monthlyFixTracker: monthlyFixTracker,
+            commandLog: commandLog
+        )
         if status.stdout.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             return false
         }
 
-        _ = try Shell.run("git add -A", currentDirectory: repoPath, failOnNonZeroExit: true)
-        _ = try Shell.run(
+        _ = try runCommand(
+            "git add -A",
+            currentDirectory: repoPath,
+            failOnNonZeroExit: true,
+            monthlyFixTracker: monthlyFixTracker,
+            commandLog: commandLog
+        )
+        _ = try runCommand(
             "git commit -m \(Shell.quote("chore: codex auto-fix for PR #\(pr.number)"))",
             currentDirectory: repoPath,
-            failOnNonZeroExit: true
+            failOnNonZeroExit: true,
+            monthlyFixTracker: monthlyFixTracker,
+            commandLog: commandLog
         )
         _ = try runCommandWithRetry(
             "git push",
             currentDirectory: repoPath,
             retries: retries,
             retryDelaySeconds: retryDelaySeconds,
-            stepName: "push"
+            stepName: "push",
+            monthlyFixTracker: monthlyFixTracker,
+            commandLog: commandLog
         )
         return true
     }
