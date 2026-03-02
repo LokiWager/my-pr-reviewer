@@ -599,7 +599,8 @@ public final class WorkflowRunner {
         monthlyFixTracker: MonthlyFixTracker,
         commandLog: (String) -> Void
     ) throws -> CommandResult {
-        commandLog("Calendar-month fixed PR count: \(monthlyFixTracker.count())")
+        _ = monthlyFixTracker
+        _ = commandLog
         return try Shell.run(
             command,
             currentDirectory: currentDirectory,
