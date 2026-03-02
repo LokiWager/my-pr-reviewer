@@ -1,5 +1,5 @@
 use anyhow::{Result, anyhow};
-use clap::{Parser, Subcommand};
+use clap::{ArgAction, Parser, Subcommand};
 use rustyline::Editor;
 use rustyline::error::ReadlineError;
 use rustyline::history::DefaultHistory;
@@ -31,6 +31,13 @@ enum Commands {
     RunPr {
         #[arg(long)]
         pr: u64,
+        #[arg(
+            long,
+            default_value_t = true,
+            action = ArgAction::Set,
+            help = "Enable compact step output (default: true). Use --compact false to disable."
+        )]
+        compact: bool,
     },
     /// Show latest report summary and file
     Report,
@@ -44,13 +51,54 @@ fn print_help() {
     println!("available commands:");
     println!("  run       - execute workflow once and stream logs");
     println!("  prs       - list all open PRs (with new/processed marker)");
-    println!("  pick N    - run review/fix for PR index from last `prs` list");
-    println!("  run-pr X  - run review/fix for PR number X");
+    println!("  pick N [--no-compact]        - run review/fix for PR index from last `prs` list");
+    println!("  run-pr X [--compact false]   - run review/fix for PR number X");
     println!("  status    - show latest run status");
     println!("  report    - show latest run report and markdown");
     println!("  settings  - print settings file path and content");
     println!("  help      - show this help");
     println!("  quit/exit - leave shell");
+}
+
+fn parse_bool_flag(value: &str) -> Option<bool> {
+    match value.to_ascii_lowercase().as_str() {
+        "true" | "1" | "yes" | "y" | "on" => Some(true),
+        "false" | "0" | "no" | "n" | "off" => Some(false),
+        _ => None,
+    }
+}
+
+fn parse_compact_mode(args: &[&str]) -> Result<bool> {
+    let mut compact = true;
+    let mut index = 0usize;
+    while index < args.len() {
+        let token = args[index];
+        if token == "--no-compact" {
+            compact = false;
+            index += 1;
+            continue;
+        }
+        if token == "--compact" {
+            if let Some(next) = args.get(index + 1)
+                && let Some(value) = parse_bool_flag(next)
+            {
+                compact = value;
+                index += 2;
+                continue;
+            }
+            compact = true;
+            index += 1;
+            continue;
+        }
+        if let Some(value) = token.strip_prefix("--compact=") {
+            compact = parse_bool_flag(value)
+                .ok_or_else(|| anyhow!("invalid --compact value: {value}"))?;
+            index += 1;
+            continue;
+        }
+        return Err(anyhow!("unknown option: {token}"));
+    }
+    Ok(compact)
 }
 
 fn run_shell_mode(paths: &StorePaths) -> Result<()> {
@@ -102,11 +150,20 @@ fn run_shell_mode(paths: &StorePaths) -> Result<()> {
                 Ok(prs) => last_pr_list = prs,
                 Err(err) => println!("prs failed: {err}"),
             },
-            "pick" if parts.len() == 2 => {
+            "pick" if parts.len() >= 2 => {
                 let index = match parts[1].parse::<usize>() {
                     Ok(v) if v > 0 => v,
                     _ => {
                         println!("invalid index: {}", parts[1]);
+                        continue;
+                    }
+                };
+                let compact = match parse_compact_mode(&parts[2..]) {
+                    Ok(value) => value,
+                    Err(err) => {
+                        println!(
+                            "pick options error: {err}. use `pick N [--no-compact]` or `pick N --compact false`"
+                        );
                         continue;
                     }
                 };
@@ -118,21 +175,23 @@ fn run_shell_mode(paths: &StorePaths) -> Result<()> {
                     continue;
                 }
                 let pr_number = last_pr_list[index - 1].number;
-                match run_single_pr_by_number(paths, pr_number, true) {
+                match run_single_pr_by_number(paths, pr_number, true, compact) {
                     Ok(snapshot) => {
-                        println!(
-                            "selected PR done: status={:?}, pr=#{} error={}",
-                            snapshot.status,
-                            pr_number,
-                            snapshot.error_message.unwrap_or_else(|| "-".to_string())
-                        );
+                        if !compact {
+                            println!(
+                                "selected PR done: status={:?}, pr=#{} error={}",
+                                snapshot.status,
+                                pr_number,
+                                snapshot.error_message.unwrap_or_else(|| "-".to_string())
+                            );
+                        }
                     }
                     Err(err) => {
-                        println!("run-pr failed for #{}: {}", pr_number, err);
+                        println!("[error] run-pr failed for #{}: {}", pr_number, err);
                     }
                 }
             }
-            "run-pr" if parts.len() == 2 => {
+            "run-pr" if parts.len() >= 2 => {
                 let pr_number = match parts[1].parse::<u64>() {
                     Ok(v) => v,
                     Err(_) => {
@@ -140,17 +199,28 @@ fn run_shell_mode(paths: &StorePaths) -> Result<()> {
                         continue;
                     }
                 };
-                match run_single_pr_by_number(paths, pr_number, true) {
-                    Ok(snapshot) => {
+                let compact = match parse_compact_mode(&parts[2..]) {
+                    Ok(value) => value,
+                    Err(err) => {
                         println!(
-                            "selected PR done: status={:?}, pr=#{} error={}",
-                            snapshot.status,
-                            pr_number,
-                            snapshot.error_message.unwrap_or_else(|| "-".to_string())
+                            "run-pr options error: {err}. use `run-pr X [--no-compact]` or `run-pr X --compact false`"
                         );
+                        continue;
+                    }
+                };
+                match run_single_pr_by_number(paths, pr_number, true, compact) {
+                    Ok(snapshot) => {
+                        if !compact {
+                            println!(
+                                "selected PR done: status={:?}, pr=#{} error={}",
+                                snapshot.status,
+                                pr_number,
+                                snapshot.error_message.unwrap_or_else(|| "-".to_string())
+                            );
+                        }
                     }
                     Err(err) => {
-                        println!("run-pr failed for #{}: {}", pr_number, err);
+                        println!("[error] run-pr failed for #{}: {}", pr_number, err);
                     }
                 }
             }
@@ -205,14 +275,16 @@ pub fn run_app() -> Result<()> {
             let _ = print_pr_list(&paths, true)?;
             Ok(())
         }
-        Commands::RunPr { pr } => {
-            let snapshot = run_single_pr_by_number(&paths, pr, true)?;
-            println!(
-                "selected PR done: status={:?}, pr=#{} error={}",
-                snapshot.status,
-                pr,
-                snapshot.error_message.unwrap_or_else(|| "-".to_string())
-            );
+        Commands::RunPr { pr, compact } => {
+            let snapshot = run_single_pr_by_number(&paths, pr, true, compact)?;
+            if !compact {
+                println!(
+                    "selected PR done: status={:?}, pr=#{} error={}",
+                    snapshot.status,
+                    pr,
+                    snapshot.error_message.unwrap_or_else(|| "-".to_string())
+                );
+            }
             Ok(())
         }
         Commands::Report => print_report(&paths),

@@ -2,7 +2,13 @@ use anyhow::{Context, Result, anyhow, bail};
 use chrono::{DateTime, Utc};
 use std::collections::HashSet;
 use std::fs;
+use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread;
+use std::time::Duration;
 use std::time::SystemTime;
 
 use crate::models::{
@@ -10,7 +16,7 @@ use crate::models::{
 };
 use crate::shell::{
     commit_and_push_if_needed, initialize_monthly_fix_counter, is_codex_review_prompt_conflict,
-    record_monthly_fixed_pr, render_exec_error, run_shell, run_with_retry,
+    monthly_fixed_pr_count, record_monthly_fixed_pr, render_exec_error, run_shell, run_with_retry,
     run_with_retry_streaming, sh_quote, sync_monthly_fix_counter_into_state,
 };
 use crate::store::{
@@ -31,10 +37,126 @@ fn append_log(snapshot: &mut RunSnapshot, message: impl AsRef<str>) {
     }
 }
 
+fn color_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::io::stdout().is_terminal()
+            && std::env::var_os("NO_COLOR").is_none()
+            && std::env::var("TERM").map(|v| v != "dumb").unwrap_or(false)
+    })
+}
+
+fn paint(text: &str, code: &str) -> String {
+    if color_enabled() {
+        format!("\x1b[{code}m{text}\x1b[0m")
+    } else {
+        text.to_string()
+    }
+}
+
+fn colorize_log_message(message: &str) -> String {
+    let lower = message.to_ascii_lowercase();
+    if lower.contains("failed") || lower.contains("error") {
+        return paint(message, "1;31");
+    }
+    if lower.contains("completed successfully")
+        || lower.contains("run finished")
+        || lower.contains("finished")
+    {
+        return paint(message, "1;32");
+    }
+    if lower.contains("review pr") {
+        return paint(message, "1;35");
+    }
+    if lower.contains("fix pr") || lower.contains("push changes") {
+        return paint(message, "1;36");
+    }
+    if lower.contains("loading") || lower.contains("sync") || lower.contains("validate") {
+        return paint(message, "1;34");
+    }
+    if message.starts_with('[') {
+        return paint(message, "1;33");
+    }
+    message.to_string()
+}
+
+fn print_compact_error(message: &str) {
+    println!("{}", paint(&format!("[error] {message}"), "1;31"));
+}
+
+fn run_compact_step<T, F>(
+    step: usize,
+    total: usize,
+    label: &str,
+    pr_number: u64,
+    action: F,
+) -> Result<T>
+where
+    F: FnOnce() -> Result<T>,
+{
+    let prefix = format!("[{step}/{total}] {label} PR #{pr_number}");
+    if !std::io::stdout().is_terminal() {
+        println!("{} {}", paint(&prefix, "1;34"), paint("⏳", "1;33"));
+        match action() {
+            Ok(value) => {
+                println!("{} {}", paint(&prefix, "1;34"), paint("✅", "1;32"));
+                Ok(value)
+            }
+            Err(err) => {
+                println!(
+                    "{} {}",
+                    paint(&format!("[error] {prefix}"), "1;31"),
+                    paint("❌", "1;31")
+                );
+                print_compact_error(&err.to_string());
+                Err(err)
+            }
+        }
+    } else {
+        let running = Arc::new(AtomicBool::new(true));
+        let running_worker = Arc::clone(&running);
+        let spinner_prefix = paint(&prefix, "1;34");
+        let worker = thread::spawn(move || {
+            let frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+            let mut index = 0usize;
+            while running_worker.load(Ordering::Relaxed) {
+                let frame = paint(frames[index % frames.len()], "1;33");
+                print!("\r{} {}", spinner_prefix, frame);
+                let _ = std::io::stdout().flush();
+                index += 1;
+                thread::sleep(Duration::from_millis(100));
+            }
+        });
+
+        let result = action();
+        running.store(false, Ordering::Relaxed);
+        let _ = worker.join();
+
+        match result {
+            Ok(value) => {
+                print!("\r{} {}\n", paint(&prefix, "1;34"), paint("✅", "1;32"));
+                let _ = std::io::stdout().flush();
+                Ok(value)
+            }
+            Err(err) => {
+                print!(
+                    "\r{} {}\n",
+                    paint(&format!("[error] {prefix}"), "1;31"),
+                    paint("❌", "1;31")
+                );
+                let _ = std::io::stdout().flush();
+                print_compact_error(&err.to_string());
+                Err(err)
+            }
+        }
+    }
+}
+
 fn log_step(snapshot: &mut RunSnapshot, message: impl AsRef<str>, verbose: bool) {
-    append_log(snapshot, message.as_ref());
+    let message = message.as_ref();
+    append_log(snapshot, message);
     if verbose {
-        println!("{}", message.as_ref());
+        println!("{}", colorize_log_message(message));
     }
 }
 
@@ -205,12 +327,21 @@ fn list_open_prs(settings: &AppSettings) -> Result<Vec<OpenPr>> {
     Ok(prs)
 }
 
-fn checkout_pr(pr_number: u64, settings: &AppSettings) -> Result<()> {
-    run_with_retry(
+fn checkout_pr(
+    pr_number: u64,
+    settings: &AppSettings,
+    stream_output: bool,
+    stream_prefix: Option<&str>,
+    compact_stream: bool,
+) -> Result<()> {
+    run_with_retry_streaming(
         &format!("gh pr checkout {pr_number}"),
         Some(&settings.repo_path),
         settings.max_command_retries,
         settings.retry_delay_seconds,
+        stream_output,
+        stream_prefix,
+        compact_stream,
     )
     .map_err(|e| anyhow!(render_exec_error(&e)))?;
     Ok(())
@@ -374,6 +505,10 @@ pub fn print_pr_list(paths: &StorePaths, sync: bool) -> Result<Vec<OpenPr>> {
 
     if filtered_prs.is_empty() {
         println!("no open PRs to show (after participant filter)");
+        println!(
+            "Calendar-month fixed PR count: {}",
+            monthly_fixed_pr_count()
+        );
         return Ok(Vec::new());
     }
 
@@ -402,6 +537,10 @@ pub fn print_pr_list(paths: &StorePaths, sync: bool) -> Result<Vec<OpenPr>> {
             author
         );
     }
+    println!(
+        "Calendar-month fixed PR count: {}",
+        monthly_fixed_pr_count()
+    );
 
     Ok(filtered_prs)
 }
@@ -415,7 +554,9 @@ fn execute_pr(
     ordinal: usize,
     total: usize,
     verbose: bool,
+    compact_step_output: bool,
 ) -> Result<PrExecutionResult> {
+    let detailed_verbose = verbose && !compact_step_output;
     snapshot.current_index = ordinal;
     snapshot.current_pr_number = Some(pr.number);
     snapshot.current_pr_title = Some(pr.title.clone());
@@ -426,7 +567,7 @@ fn execute_pr(
             "[{}/{}] Processing PR #{}: {}",
             ordinal, total, pr.number, pr.title
         ),
-        verbose,
+        detailed_verbose,
     );
     save_snapshot(paths, snapshot)?;
 
@@ -437,8 +578,24 @@ fn execute_pr(
     );
     let report_path = paths.reports.join(report_name);
 
-    log_step(snapshot, format!("Checkout PR #{}", pr.number), verbose);
-    checkout_pr(pr.number, settings)?;
+    log_step(
+        snapshot,
+        format!("Checkout PR #{}", pr.number),
+        detailed_verbose,
+    );
+    if compact_step_output {
+        run_compact_step(1, 4, "Processing", pr.number, || {
+            checkout_pr(pr.number, settings, false, Some("[processing] "), false)
+        })?;
+    } else {
+        checkout_pr(
+            pr.number,
+            settings,
+            detailed_verbose,
+            Some("[processing] "),
+            false,
+        )?;
+    }
 
     let mut review_cmd = expand_template(
         &settings.review_command_template,
@@ -446,34 +603,47 @@ fn execute_pr(
         settings,
         &report_path,
     );
-    log_step(snapshot, format!("Review PR #{}", pr.number), verbose);
-    let review_result = match run_with_retry_streaming(
-        &review_cmd,
-        Some(&settings.repo_path),
-        settings.max_command_retries,
-        settings.retry_delay_seconds,
-        verbose,
-        Some("[review] "),
-    ) {
-        Ok(result) => result,
-        Err(err) if is_codex_review_prompt_conflict(&err) => {
-            review_cmd = format!("codex review --base {}", sh_quote(&settings.default_branch));
-            log_step(
-                snapshot,
-                "Detected codex review --base prompt conflict, fallback to bare --base",
-                verbose,
-            );
-            run_with_retry_streaming(
-                &review_cmd,
-                Some(&settings.repo_path),
-                settings.max_command_retries,
-                settings.retry_delay_seconds,
-                verbose,
-                Some("[review] "),
-            )
-            .map_err(|e| anyhow!(render_exec_error(&e)))?
+    log_step(
+        snapshot,
+        format!("Review PR #{}", pr.number),
+        detailed_verbose,
+    );
+    let mut review_exec = || -> Result<crate::shell::CommandResult> {
+        match run_with_retry_streaming(
+            &review_cmd,
+            Some(&settings.repo_path),
+            settings.max_command_retries,
+            settings.retry_delay_seconds,
+            detailed_verbose,
+            Some("[review] "),
+            false,
+        ) {
+            Ok(result) => Ok(result),
+            Err(err) if is_codex_review_prompt_conflict(&err) => {
+                review_cmd = format!("codex review --base {}", sh_quote(&settings.default_branch));
+                log_step(
+                    snapshot,
+                    "Detected codex review --base prompt conflict, fallback to bare --base",
+                    detailed_verbose,
+                );
+                run_with_retry_streaming(
+                    &review_cmd,
+                    Some(&settings.repo_path),
+                    settings.max_command_retries,
+                    settings.retry_delay_seconds,
+                    detailed_verbose,
+                    Some("[review] "),
+                    false,
+                )
+                .map_err(|e| anyhow!(render_exec_error(&e)))
+            }
+            Err(err) => Err(anyhow!(render_exec_error(&err))),
         }
-        Err(err) => return Err(anyhow!(render_exec_error(&err))),
+    };
+    let review_result = if compact_step_output {
+        run_compact_step(2, 4, "Review", pr.number, review_exec)?
+    } else {
+        review_exec()?
     };
     write_report(&report_path, pr, &review_cmd, &review_result, "review")?;
 
@@ -481,16 +651,24 @@ fn execute_pr(
     save_snapshot(paths, snapshot)?;
 
     let fix_cmd = expand_template(&settings.fix_command_template, pr, settings, &report_path);
-    log_step(snapshot, format!("Fix PR #{}", pr.number), verbose);
-    let fix_result = run_with_retry_streaming(
-        &fix_cmd,
-        Some(&settings.repo_path),
-        settings.max_command_retries,
-        settings.retry_delay_seconds,
-        verbose,
-        Some("[fix] "),
-    )
-    .map_err(|e| anyhow!(render_exec_error(&e)))?;
+    log_step(snapshot, format!("Fix PR #{}", pr.number), detailed_verbose);
+    let fix_exec = || -> Result<crate::shell::CommandResult> {
+        run_with_retry_streaming(
+            &fix_cmd,
+            Some(&settings.repo_path),
+            settings.max_command_retries,
+            settings.retry_delay_seconds,
+            detailed_verbose,
+            Some("[fix] "),
+            false,
+        )
+        .map_err(|e| anyhow!(render_exec_error(&e)))
+    };
+    let fix_result = if compact_step_output {
+        run_compact_step(3, 4, "Fix", pr.number, fix_exec)?
+    } else {
+        fix_exec()?
+    };
 
     let mut pushed = false;
     if settings.auto_push_enabled {
@@ -499,38 +677,31 @@ fn execute_pr(
         log_step(
             snapshot,
             format!("Push changes for PR #{}", pr.number),
-            verbose,
+            detailed_verbose,
         );
-        pushed = commit_and_push_if_needed(
-            pr,
-            &settings.repo_path,
-            settings.max_command_retries,
-            settings.retry_delay_seconds,
-        )
-        .map_err(|e| anyhow!(render_exec_error(&e)))?;
+        let commit_exec = || -> Result<bool> {
+            commit_and_push_if_needed(
+                pr,
+                &settings.repo_path,
+                settings.max_command_retries,
+                settings.retry_delay_seconds,
+                detailed_verbose,
+                Some("[commit] "),
+                false,
+            )
+            .map_err(|e| anyhow!(render_exec_error(&e)))
+        };
+        pushed = if compact_step_output {
+            run_compact_step(4, 4, "Commit", pr.number, commit_exec)?
+        } else {
+            commit_exec()?
+        };
     }
 
     if review_result.exit_code == 0 && fix_result.exit_code == 0 && pushed {
         if record_monthly_fixed_pr(pr.number) {
-            log_step(
-                snapshot,
-                format!(
-                    "Counter updated: PR #{} counted for this calendar month",
-                    pr.number
-                ),
-                verbose,
-            );
             sync_monthly_fix_counter_into_state(state);
             save_engine_state(paths, state)?;
-        } else {
-            log_step(
-                snapshot,
-                format!(
-                    "Counter unchanged: PR #{} already counted this calendar month",
-                    pr.number
-                ),
-                verbose,
-            );
         }
     }
 
@@ -667,6 +838,12 @@ pub fn run_workflow(paths: &StorePaths, verbose: bool) -> Result<RunSnapshot> {
         sync_monthly_fix_counter_into_state(&mut state);
         save_engine_state(paths, &state)?;
         log_step(&mut snapshot, "No new PRs, run finished", verbose);
+        if verbose {
+            println!(
+                "Calendar-month fixed PR count: {}",
+                monthly_fixed_pr_count()
+            );
+        }
         save_snapshot(paths, &snapshot)?;
         return Ok(snapshot);
     }
@@ -684,6 +861,7 @@ pub fn run_workflow(paths: &StorePaths, verbose: bool) -> Result<RunSnapshot> {
             idx + 1,
             total_prs,
             verbose,
+            false,
         ) {
             Ok(pr_result) => {
                 processed_set.insert(pr.number);
@@ -747,6 +925,12 @@ pub fn run_workflow(paths: &StorePaths, verbose: bool) -> Result<RunSnapshot> {
 
     snapshot.finished_at = Some(now());
     save_snapshot(paths, &snapshot)?;
+    if verbose {
+        println!(
+            "Calendar-month fixed PR count: {}",
+            monthly_fixed_pr_count()
+        );
+    }
     Ok(snapshot)
 }
 
@@ -754,7 +938,9 @@ pub fn run_single_pr_by_number(
     paths: &StorePaths,
     pr_number: u64,
     verbose: bool,
+    compact_step_output: bool,
 ) -> Result<RunSnapshot> {
+    let detailed_verbose = verbose && !compact_step_output;
     let (settings, prs, mut processed_set) = fetch_open_prs_with_state(paths, true)?;
     let pr = prs
         .into_iter()
@@ -779,7 +965,7 @@ pub fn run_single_pr_by_number(
     log_step(
         &mut snapshot,
         format!("Start selected PR run for #{}", pr.number),
-        verbose,
+        detailed_verbose,
     );
     save_snapshot(paths, &snapshot)?;
 
@@ -792,6 +978,7 @@ pub fn run_single_pr_by_number(
         1,
         1,
         verbose,
+        compact_step_output,
     ) {
         Ok(result) => {
             processed_set.insert(pr.number);
@@ -801,7 +988,7 @@ pub fn run_single_pr_by_number(
             log_step(
                 &mut snapshot,
                 format!("Selected PR #{} completed successfully", pr.number),
-                verbose,
+                detailed_verbose,
             );
         }
         Err(err) => {
@@ -821,7 +1008,7 @@ pub fn run_single_pr_by_number(
             log_step(
                 &mut snapshot,
                 format!("Selected PR #{} failed: {err}", pr.number),
-                verbose,
+                detailed_verbose,
             );
         }
     }
@@ -841,6 +1028,12 @@ pub fn run_single_pr_by_number(
     snapshot.finished_at = Some(now());
     snapshot.current_index = 1;
     save_snapshot(paths, &snapshot)?;
+    if verbose && !compact_step_output {
+        println!(
+            "Calendar-month fixed PR count: {}",
+            monthly_fixed_pr_count()
+        );
+    }
     Ok(snapshot)
 }
 

@@ -1,9 +1,9 @@
 use anyhow::anyhow;
 use chrono::{Local, Utc};
-use std::fs;
-use std::io::{BufRead, BufReader};
-use std::process::{Command, Stdio};
 use std::collections::HashSet;
+use std::fs;
+use std::io::{BufRead, BufReader, IsTerminal, Write};
+use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
@@ -66,6 +66,34 @@ fn current_month_key() -> String {
     Local::now().format("%Y-%m").to_string()
 }
 
+fn ansi_color_enabled() -> bool {
+    std::io::stdout().is_terminal()
+        && std::env::var_os("NO_COLOR").is_none()
+        && std::env::var("TERM").map(|v| v != "dumb").unwrap_or(false)
+}
+
+fn paint(text: &str, code: &str) -> String {
+    if ansi_color_enabled() {
+        format!("\x1b[{code}m{text}\x1b[0m")
+    } else {
+        text.to_string()
+    }
+}
+
+fn colorize_stream_prefix(prefix: &str) -> String {
+    let lower = prefix.to_ascii_lowercase();
+    if lower.contains("review") {
+        return paint(prefix, "1;35");
+    }
+    if lower.contains("fix") {
+        return paint(prefix, "1;36");
+    }
+    if lower.contains("push") {
+        return paint(prefix, "1;33");
+    }
+    paint(prefix, "1;34")
+}
+
 fn monthly_fix_counter() -> &'static Mutex<MonthlyFixCounter> {
     static COUNTER: OnceLock<Mutex<MonthlyFixCounter>> = OnceLock::new();
     COUNTER.get_or_init(|| Mutex::new(MonthlyFixCounter::empty_for_current_month()))
@@ -122,7 +150,7 @@ pub fn run_shell(
     cwd: Option<&str>,
     fail_on_non_zero: bool,
 ) -> std::result::Result<CommandResult, ExecError> {
-    run_shell_internal(command, cwd, fail_on_non_zero, false, None)
+    run_shell_internal(command, cwd, fail_on_non_zero, false, None, false)
 }
 
 pub fn run_shell_internal(
@@ -131,12 +159,8 @@ pub fn run_shell_internal(
     fail_on_non_zero: bool,
     stream_output: bool,
     stream_prefix: Option<&str>,
+    compact_stream: bool,
 ) -> std::result::Result<CommandResult, ExecError> {
-    println!(
-        "Calendar-month fixed PR count: {}",
-        monthly_fixed_pr_count()
-    );
-
     let mut cmd = Command::new("/bin/zsh");
     cmd.arg("-lc").arg(command);
     if let Some(dir) = cwd {
@@ -177,6 +201,11 @@ pub fn run_shell_internal(
 
         let mut out_buf = String::new();
         let mut err_buf = String::new();
+        let use_compact_stream = compact_stream
+            && stream_prefix.is_some()
+            && std::io::stdout().is_terminal()
+            && std::env::var("TERM").map(|v| v != "dumb").unwrap_or(false);
+        let mut compact_renderer = use_compact_stream.then(|| CompactStepRenderer::new(5));
         for (is_stdout, line) in rx {
             if is_stdout {
                 out_buf.push_str(&line);
@@ -186,17 +215,23 @@ pub fn run_shell_internal(
                 err_buf.push('\n');
             }
 
-            if let Some(prefix) = stream_prefix {
+            if let Some(renderer) = compact_renderer.as_mut() {
+                renderer.push(is_stdout, &line);
+            } else if let Some(prefix) = stream_prefix {
+                let styled_prefix = colorize_stream_prefix(prefix);
                 if is_stdout {
-                    println!("{prefix}{line}");
+                    println!("{styled_prefix}{line}");
                 } else {
-                    eprintln!("{prefix}{line}");
+                    eprintln!("{}{}", styled_prefix, paint(&line, "31"));
                 }
             } else if is_stdout {
                 println!("{line}");
             } else {
-                eprintln!("{line}");
+                eprintln!("{}", paint(&line, "31"));
             }
+        }
+        if let Some(renderer) = compact_renderer.as_mut() {
+            renderer.clear();
         }
 
         let status = child
@@ -235,7 +270,15 @@ pub fn run_with_retry(
     retries: u8,
     retry_delay_seconds: u64,
 ) -> std::result::Result<CommandResult, ExecError> {
-    run_with_retry_streaming(command, cwd, retries, retry_delay_seconds, false, None)
+    run_with_retry_streaming(
+        command,
+        cwd,
+        retries,
+        retry_delay_seconds,
+        false,
+        None,
+        false,
+    )
 }
 
 pub fn run_with_retry_streaming(
@@ -245,12 +288,20 @@ pub fn run_with_retry_streaming(
     retry_delay_seconds: u64,
     stream_output: bool,
     stream_prefix: Option<&str>,
+    compact_stream: bool,
 ) -> std::result::Result<CommandResult, ExecError> {
     let attempts = retries.max(1) as usize + 1;
     let mut last_err: Option<ExecError> = None;
 
     for attempt in 1..=attempts {
-        match run_shell_internal(command, cwd, true, stream_output, stream_prefix) {
+        match run_shell_internal(
+            command,
+            cwd,
+            true,
+            stream_output,
+            stream_prefix,
+            compact_stream,
+        ) {
             Ok(result) => return Ok(result),
             Err(err) => {
                 last_err = Some(err);
@@ -262,6 +313,63 @@ pub fn run_with_retry_streaming(
     }
 
     Err(last_err.unwrap_or_else(|| ExecError::Io("unknown command failure".to_string())))
+}
+
+struct CompactStepRenderer {
+    max_lines: usize,
+    rendered_once: bool,
+    next_row: usize,
+}
+
+impl CompactStepRenderer {
+    fn new(max_lines: usize) -> Self {
+        Self {
+            max_lines,
+            rendered_once: false,
+            next_row: 0,
+        }
+    }
+
+    fn push(&mut self, _is_stdout: bool, line: &str) {
+        let normalized = format!("[info] {line}");
+
+        if !self.rendered_once {
+            for _ in 0..self.max_lines {
+                println!();
+            }
+            self.rendered_once = true;
+            self.next_row = 0;
+        }
+
+        let row = self.next_row;
+        self.next_row = (self.next_row + 1) % self.max_lines;
+
+        let up = self.max_lines.saturating_sub(row);
+        let rendered_line = paint(&normalized, "90");
+        if up > 0 {
+            print!("\x1b[{}A", up);
+        }
+        print!("\r\x1b[2K{rendered_line}");
+        if up > 0 {
+            print!("\x1b[{}B", up);
+        }
+        print!("\r");
+        let _ = std::io::stdout().flush();
+    }
+
+    fn clear(&mut self) {
+        if !self.rendered_once {
+            return;
+        }
+        let block_lines = self.max_lines;
+        print!("\x1b[{}A", block_lines);
+        for _ in 0..block_lines {
+            print!("\r\x1b[2K\x1b[1B");
+        }
+        print!("\x1b[{}A", block_lines);
+        let _ = std::io::stdout().flush();
+        self.rendered_once = false;
+    }
 }
 
 pub fn render_exec_error(err: &ExecError) -> String {
@@ -303,8 +411,20 @@ pub fn strip_co_authored_by_trailers(message: &str) -> String {
     filtered.trim_end().to_string() + "\n"
 }
 
-pub fn sanitize_latest_commit_message(repo_path: &str) -> std::result::Result<(), ExecError> {
-    let latest = run_shell("git log -1 --pretty=%B", Some(repo_path), true)?;
+pub fn sanitize_latest_commit_message(
+    repo_path: &str,
+    stream_output: bool,
+    stream_prefix: Option<&str>,
+    compact_stream: bool,
+) -> std::result::Result<(), ExecError> {
+    let latest = run_shell_internal(
+        "git log -1 --pretty=%B",
+        Some(repo_path),
+        true,
+        stream_output,
+        stream_prefix,
+        compact_stream,
+    )?;
     let cleaned = strip_co_authored_by_trailers(&latest.stdout);
     if cleaned.trim_end() == latest.stdout.trim_end() {
         return Ok(());
@@ -323,13 +443,16 @@ pub fn sanitize_latest_commit_message(repo_path: &str) -> std::result::Result<()
         ))
     })?;
 
-    let amend = run_shell(
+    let amend = run_shell_internal(
         &format!(
             "git -c core.hooksPath=/dev/null commit --amend --no-verify -F {}",
             sh_quote(&temp_file.display().to_string())
         ),
         Some(repo_path),
         true,
+        stream_output,
+        stream_prefix,
+        compact_stream,
     );
     let _ = fs::remove_file(&temp_file);
     amend.map(|_| ())
@@ -340,24 +463,52 @@ pub fn commit_and_push_if_needed(
     repo_path: &str,
     retries: u8,
     retry_delay_seconds: u64,
+    stream_output: bool,
+    stream_prefix: Option<&str>,
+    compact_stream: bool,
 ) -> std::result::Result<bool, ExecError> {
-    let status = run_shell("git status --porcelain", Some(repo_path), true)?;
+    let status = run_shell_internal(
+        "git status --porcelain",
+        Some(repo_path),
+        true,
+        stream_output,
+        stream_prefix,
+        compact_stream,
+    )?;
     if status.stdout.trim().is_empty() {
         return Ok(false);
     }
 
-    run_shell("git add -A", Some(repo_path), true)?;
-    run_shell(
+    run_shell_internal(
+        "git add -A",
+        Some(repo_path),
+        true,
+        stream_output,
+        stream_prefix,
+        compact_stream,
+    )?;
+    run_shell_internal(
         &format!(
             "git -c core.hooksPath=/dev/null commit --no-verify -m {}",
             sh_quote(&format!("chore: auto-fix for PR #{}", pr.number))
         ),
         Some(repo_path),
         true,
+        stream_output,
+        stream_prefix,
+        compact_stream,
     )?;
-    sanitize_latest_commit_message(repo_path)?;
+    sanitize_latest_commit_message(repo_path, stream_output, stream_prefix, compact_stream)?;
 
-    run_with_retry("git push", Some(repo_path), retries, retry_delay_seconds)?;
+    run_with_retry_streaming(
+        "git push",
+        Some(repo_path),
+        retries,
+        retry_delay_seconds,
+        stream_output,
+        stream_prefix,
+        compact_stream,
+    )?;
 
     Ok(true)
 }
