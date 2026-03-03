@@ -4,3 +4,4 @@ DerivedData/
 *.xcworkspace
 *.xcodeproj/xcuserdata/
 *.swiftpm/
+.idea
