@@ -3,6 +3,7 @@ use chrono::{Local, Utc};
 use std::collections::HashSet;
 use std::fs;
 use std::io::{BufRead, BufReader, IsTerminal, Write};
+use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::sync::{Mutex, OnceLock};
@@ -458,8 +459,205 @@ pub fn sanitize_latest_commit_message(
     amend.map(|_| ())
 }
 
+#[derive(Debug, Clone)]
+struct ReviewFinding {
+    issue_level: u8,
+    title: String,
+}
+
+fn parse_review_findings(text: &str) -> Vec<ReviewFinding> {
+    let mut findings = Vec::new();
+
+    for raw_line in text.lines() {
+        let line = raw_line.trim();
+        if !line.starts_with("- [") {
+            continue;
+        }
+
+        let bracketed = &line[2..];
+        if !bracketed.starts_with('[') {
+            continue;
+        }
+        let Some(close_idx) = bracketed.find(']') else {
+            continue;
+        };
+
+        let level_token = bracketed[1..close_idx].trim().to_ascii_uppercase();
+        if level_token.len() != 2 || !level_token.starts_with('P') {
+            continue;
+        }
+        let level_digit = level_token.as_bytes()[1];
+        if !(b'0'..=b'3').contains(&level_digit) {
+            continue;
+        }
+        let issue_level = level_digit - b'0';
+
+        let remainder = bracketed[close_idx + 1..].trim();
+        if remainder.is_empty() {
+            continue;
+        }
+        let title_source = remainder
+            .split_once('—')
+            .map(|(left, _)| left)
+            .unwrap_or(remainder)
+            .trim();
+        if title_source.is_empty() {
+            continue;
+        }
+        let title = title_source
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .trim_end_matches('.')
+            .to_string();
+        if title.is_empty() {
+            continue;
+        }
+
+        findings.push(ReviewFinding { issue_level, title });
+    }
+
+    findings
+}
+
+fn highest_issue_level_from_findings(findings: &[ReviewFinding]) -> String {
+    let best = findings.iter().map(|item| item.issue_level).min();
+    best.map(|value| format!("P{value}"))
+        .unwrap_or_else(|| "Unknown".to_string())
+}
+
+fn infer_issue_level_from_text(text: &str) -> String {
+    let findings = parse_review_findings(text);
+    if !findings.is_empty() {
+        return highest_issue_level_from_findings(&findings);
+    }
+
+    let mut best_p_level: Option<u8> = None;
+    let mut has_critical = false;
+    let mut has_high = false;
+    let mut has_medium = false;
+    let mut has_low = false;
+
+    for token in text.split(|c: char| !c.is_ascii_alphanumeric()) {
+        if token.is_empty() {
+            continue;
+        }
+        let lower = token.to_ascii_lowercase();
+        if lower.len() == 2
+            && lower.starts_with('p')
+            && let Some(digit) = lower.chars().nth(1)
+            && ('0'..='3').contains(&digit)
+        {
+            let value = digit as u8 - b'0';
+            best_p_level = Some(best_p_level.map_or(value, |current| current.min(value)));
+            continue;
+        }
+
+        match lower.as_str() {
+            "critical" | "blocker" | "sev1" | "severity1" => has_critical = true,
+            "high" | "sev2" | "severity2" => has_high = true,
+            "medium" | "med" | "sev3" | "severity3" => has_medium = true,
+            "low" | "minor" | "sev4" | "severity4" => has_low = true,
+            _ => {}
+        }
+    }
+
+    if let Some(value) = best_p_level {
+        return format!("P{value}");
+    }
+    if has_critical {
+        return "P0".to_string();
+    }
+    if has_high {
+        return "P1".to_string();
+    }
+    if has_medium {
+        return "P2".to_string();
+    }
+    if has_low {
+        return "P3".to_string();
+    }
+    "Unknown".to_string()
+}
+
+fn summarize_change_from_findings(findings: &[ReviewFinding]) -> Option<String> {
+    if findings.is_empty() {
+        return None;
+    }
+
+    let mut titles: Vec<String> = findings
+        .iter()
+        .take(2)
+        .map(|item| item.title.clone())
+        .collect();
+    titles.retain(|item| !item.is_empty());
+    if titles.is_empty() {
+        return None;
+    }
+
+    if findings.len() == 1 {
+        return Some(format!("Apply review suggestion: {}.", titles[0]));
+    }
+
+    if findings.len() == 2 {
+        return Some(format!(
+            "Apply review suggestions: {}; {}.",
+            titles[0], titles[1]
+        ));
+    }
+
+    Some(format!(
+        "Apply review suggestions: {}; {} (+{} more).",
+        titles[0],
+        titles[1],
+        findings.len() - 2
+    ))
+}
+
+fn derive_commit_context_from_report(report_path: Option<&Path>) -> (String, String) {
+    let default_summary = "Apply automated fixes based on review findings.".to_string();
+
+    let Some(path) = report_path else {
+        return (default_summary, "Unknown".to_string());
+    };
+    let content = match fs::read_to_string(path) {
+        Ok(value) => value,
+        Err(_) => return (default_summary, "Unknown".to_string()),
+    };
+
+    let findings = parse_review_findings(&content);
+    if !findings.is_empty() {
+        let issue_level = highest_issue_level_from_findings(&findings);
+        let summary =
+            summarize_change_from_findings(&findings).unwrap_or_else(|| default_summary.clone());
+        return (summary, issue_level);
+    }
+
+    let issue_level = infer_issue_level_from_text(&content);
+    (default_summary, issue_level)
+}
+
+fn format_summary_with_level(issue_level: &str, summary: &str) -> String {
+    let level_tag = if issue_level.starts_with('P') {
+        issue_level.to_string()
+    } else {
+        "Pn".to_string()
+    };
+    format!("[{level_tag}] {summary}")
+}
+
+fn build_commit_message(pr_number: u64, issue_level: &str, summary: &str) -> String {
+    let mut message = format!("chore: auto-fix for PR #{pr_number}\n\n");
+    message.push_str(&format!(
+        "Summary: {}\n",
+        format_summary_with_level(issue_level, summary)
+    ));
+    message
+}
+
 pub fn commit_and_push_if_needed(
     pr: &OpenPr,
+    report_path: Option<&Path>,
     repo_path: &str,
     retries: u8,
     retry_delay_seconds: u64,
@@ -487,17 +685,34 @@ pub fn commit_and_push_if_needed(
         stream_prefix,
         compact_stream,
     )?;
-    run_shell_internal(
+    let (summary, issue_level) = derive_commit_context_from_report(report_path);
+    let commit_message = build_commit_message(pr.number, &issue_level, &summary);
+    let temp_file = std::env::temp_dir().join(format!(
+        "pr-reviewer-commit-msg-{}-{}.txt",
+        std::process::id(),
+        Utc::now().timestamp_nanos_opt().unwrap_or_default()
+    ));
+    fs::write(&temp_file, commit_message).map_err(|e| {
+        ExecError::Io(format!(
+            "failed to write temp commit message file {}: {}",
+            temp_file.display(),
+            e
+        ))
+    })?;
+
+    let commit_result = run_shell_internal(
         &format!(
-            "git -c core.hooksPath=/dev/null commit --no-verify -m {}",
-            sh_quote(&format!("chore: auto-fix for PR #{}", pr.number))
+            "git -c core.hooksPath=/dev/null commit --no-verify -F {}",
+            sh_quote(&temp_file.display().to_string())
         ),
         Some(repo_path),
         true,
         stream_output,
         stream_prefix,
         compact_stream,
-    )?;
+    );
+    let _ = fs::remove_file(&temp_file);
+    commit_result?;
     sanitize_latest_commit_message(repo_path, stream_output, stream_prefix, compact_stream)?;
 
     run_with_retry_streaming(
@@ -515,4 +730,77 @@ pub fn commit_and_push_if_needed(
 
 pub fn anyhow_from_exec(err: ExecError) -> anyhow::Error {
     anyhow!(render_exec_error(&err))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        build_commit_message, derive_commit_context_from_report, format_summary_with_level,
+        infer_issue_level_from_text, parse_review_findings, summarize_change_from_findings,
+    };
+
+    #[test]
+    fn infer_issue_level_prefers_highest_priority_p_level() {
+        let text = "Findings: [P2] null pointer risk; [P1] auth bypass";
+        assert_eq!(infer_issue_level_from_text(text), "P1");
+    }
+
+    #[test]
+    fn parse_review_findings_extracts_final_suggestions() {
+        let text = "\
+            OpenAI Codex v0.98.0 (research preview)\n\
+            model: gpt-5.3-codex\n\
+            - [P1] Detect POSTPAY from nested GCP payment schedule — /tmp/a.ts:1\n\
+            - [P2] Clear stale metric columns before early return — /tmp/b.ts:2\n";
+        let findings = parse_review_findings(text);
+        assert_eq!(findings.len(), 2);
+        assert_eq!(findings[0].issue_level, 1);
+        assert_eq!(
+            findings[0].title,
+            "Detect POSTPAY from nested GCP payment schedule"
+        );
+    }
+
+    #[test]
+    fn summarize_change_from_findings_uses_findings_instead_of_headers() {
+        let text = "- [P1] Detect POSTPAY from nested GCP payment schedule — /tmp/a.ts:1";
+        let findings = parse_review_findings(text);
+        let summary = summarize_change_from_findings(&findings);
+        assert_eq!(
+            summary.as_deref(),
+            Some("Apply review suggestion: Detect POSTPAY from nested GCP payment schedule.")
+        );
+    }
+
+    #[test]
+    fn derive_context_uses_fallback_when_report_missing() {
+        let (summary, level) = derive_commit_context_from_report(None);
+        assert_eq!(summary, "Apply automated fixes based on review findings.");
+        assert_eq!(level, "Unknown");
+    }
+
+    #[test]
+    fn format_summary_with_level_prefixes_priority() {
+        let summary = format_summary_with_level(
+            "P1",
+            "Apply review suggestion: Detect POSTPAY from nested GCP payment schedule.",
+        );
+        assert_eq!(
+            summary,
+            "[P1] Apply review suggestion: Detect POSTPAY from nested GCP payment schedule."
+        );
+    }
+
+    #[test]
+    fn build_commit_message_includes_only_summary_with_level_prefix() {
+        let message = build_commit_message(
+            42,
+            "P1",
+            "Apply review suggestion: Detect POSTPAY from nested GCP payment schedule.",
+        );
+        assert!(message.contains("PR #42"));
+        assert!(message.contains("Summary: [P1] Apply review suggestion: Detect POSTPAY from nested GCP payment schedule."));
+        assert!(!message.contains("Reason:"));
+        assert!(!message.contains("Issue level:"));
+    }
 }

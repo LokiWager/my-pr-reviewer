@@ -682,6 +682,7 @@ fn execute_pr(
         let commit_exec = || -> Result<bool> {
             commit_and_push_if_needed(
                 pr,
+                Some(report_path.as_path()),
                 &settings.repo_path,
                 settings.max_command_retries,
                 settings.retry_delay_seconds,
