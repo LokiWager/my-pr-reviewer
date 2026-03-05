@@ -655,6 +655,77 @@ fn build_commit_message(pr_number: u64, issue_level: &str, summary: &str) -> Str
     message
 }
 
+fn extract_codex_commit_message(stdout: &str) -> Option<String> {
+    let start_tag = "BEGIN_COMMIT_MESSAGE";
+    let end_tag = "END_COMMIT_MESSAGE";
+    let selected = if let Some(start_idx) = stdout.find(start_tag) {
+        let body_start = start_idx + start_tag.len();
+        let rest = &stdout[body_start..];
+        if let Some(end_idx) = rest.find(end_tag) {
+            &rest[..end_idx]
+        } else {
+            rest
+        }
+    } else {
+        stdout
+    };
+
+    let mut message = selected
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with("```"))
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    if let Some(value) = message.strip_prefix("Commit message:") {
+        message = value.trim().to_string();
+    }
+
+    if message.is_empty() {
+        return None;
+    }
+
+    let max_chars = 160usize;
+    if message.chars().count() > max_chars {
+        message = message.chars().take(max_chars).collect::<String>();
+        message = message.trim_end().to_string();
+    }
+
+    Some(message)
+}
+
+fn generate_commit_message_with_codex(
+    pr: &OpenPr,
+    report_path: Option<&Path>,
+    repo_path: &str,
+) -> Option<String> {
+    let report_hint = report_path
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|| "N/A".to_string());
+    let prompt = format!(
+        "You are generating a git commit message for staged changes in the current repository.\n\
+PR #{pr_number}: {pr_title}\n\
+Review report path: {report_hint}\n\
+Read the staged diff (`git diff --cached`) and produce one short summary line in plain text.\n\
+Requirements:\n\
+- <= 120 characters\n\
+- no markdown, no code fences, no quotes\n\
+- describe what was fixed\n\
+Output must use this exact wrapper:\n\
+BEGIN_COMMIT_MESSAGE\n\
+<your single-line message>\n\
+END_COMMIT_MESSAGE",
+        pr_number = pr.number,
+        pr_title = pr.title
+    );
+    let command = format!("codex exec {}", sh_quote(&prompt));
+    let result = run_shell_internal(&command, Some(repo_path), false, false, None, false).ok()?;
+    if result.exit_code != 0 {
+        return None;
+    }
+    extract_codex_commit_message(&result.stdout)
+}
+
 pub fn commit_and_push_if_needed(
     pr: &OpenPr,
     report_path: Option<&Path>,
@@ -685,8 +756,12 @@ pub fn commit_and_push_if_needed(
         stream_prefix,
         compact_stream,
     )?;
-    let (summary, issue_level) = derive_commit_context_from_report(report_path);
-    let commit_message = build_commit_message(pr.number, &issue_level, &summary);
+    let fallback_message = || {
+        let (summary, issue_level) = derive_commit_context_from_report(report_path);
+        build_commit_message(pr.number, &issue_level, &summary)
+    };
+    let commit_message = generate_commit_message_with_codex(pr, report_path, repo_path)
+        .unwrap_or_else(fallback_message);
     let temp_file = std::env::temp_dir().join(format!(
         "pr-reviewer-commit-msg-{}-{}.txt",
         std::process::id(),
@@ -735,8 +810,9 @@ pub fn anyhow_from_exec(err: ExecError) -> anyhow::Error {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_commit_message, derive_commit_context_from_report, format_summary_with_level,
-        infer_issue_level_from_text, parse_review_findings, summarize_change_from_findings,
+        build_commit_message, derive_commit_context_from_report, extract_codex_commit_message,
+        format_summary_with_level, infer_issue_level_from_text, parse_review_findings,
+        summarize_change_from_findings,
     };
 
     #[test]
@@ -802,5 +878,37 @@ mod tests {
         assert!(message.contains("Summary: [P1] Apply review suggestion: Detect POSTPAY from nested GCP payment schedule."));
         assert!(!message.contains("Reason:"));
         assert!(!message.contains("Issue level:"));
+    }
+
+    #[test]
+    fn extract_codex_commit_message_prefers_wrapped_section() {
+        let output = "\
+OpenAI Codex\n\
+BEGIN_COMMIT_MESSAGE\n\
+fix: handle nested payment schedule in POSTPAY detection\n\
+END_COMMIT_MESSAGE\n\
+extra";
+        let message = extract_codex_commit_message(output);
+        assert_eq!(
+            message.as_deref(),
+            Some("fix: handle nested payment schedule in POSTPAY detection")
+        );
+    }
+
+    #[test]
+    fn extract_codex_commit_message_handles_unwrapped_output() {
+        let output = "Commit message: fix: clear stale metric columns before early return";
+        let message = extract_codex_commit_message(output);
+        assert_eq!(
+            message.as_deref(),
+            Some("fix: clear stale metric columns before early return")
+        );
+    }
+
+    #[test]
+    fn extract_codex_commit_message_returns_none_for_empty_output() {
+        let output = "```";
+        let message = extract_codex_commit_message(output);
+        assert!(message.is_none());
     }
 }
