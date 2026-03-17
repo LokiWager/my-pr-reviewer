@@ -94,6 +94,20 @@ pub fn load_settings(paths: &StorePaths) -> Result<AppSettings> {
         migrated = true;
     }
 
+    if settings.fix_command_template
+        == "codex exec \"You are in a checked-out PR branch. Read findings and fix issues for PR #{{PR_NUMBER}} ({{PR_TITLE}}). Use report context at {{REPORT_PATH}} when relevant. Make minimal safe changes and update tests if needed.\""
+    {
+        settings.fix_command_template = default_fix_template();
+        migrated = true;
+    }
+
+    if settings.fix_command_template
+        == "codex exec -s workspace-write -a never \"You are in a checked-out PR branch. Read findings and fix issues for PR #{{PR_NUMBER}} ({{PR_TITLE}}). Use report context at {{REPORT_PATH}} when relevant. Make minimal safe changes and update tests if needed.\""
+    {
+        settings.fix_command_template = default_fix_template();
+        migrated = true;
+    }
+
     if migrated {
         save_json(&paths.settings, &settings)?;
     }

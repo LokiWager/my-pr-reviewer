@@ -476,6 +476,7 @@ public final class WorkflowRunner {
                 log("Commit and push")
                 pushed = try commitAndPushIfNeeded(
                     pr: pr,
+                    reportPath: reportURL.path,
                     repoPath: workDir.path,
                     retries: settings.maxCommandRetries,
                     retryDelaySeconds: settings.retryDelaySeconds,
@@ -731,6 +732,7 @@ public final class WorkflowRunner {
 
     private func commitAndPushIfNeeded(
         pr: OpenPR,
+        reportPath: String,
         repoPath: String,
         retries: Int,
         retryDelaySeconds: Int,
@@ -755,8 +757,22 @@ public final class WorkflowRunner {
             monthlyFixTracker: monthlyFixTracker,
             commandLog: commandLog
         )
+        let commitContext = deriveCommitContext(fromReportPath: reportPath)
+        let commitMessage = buildCommitMessage(
+            prNumber: pr.number,
+            issueLevel: commitContext.issueLevel,
+            summary: commitContext.summary
+        )
+
+        let messageURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("pr-reviewer-commit-msg-\(UUID().uuidString).txt", isDirectory: false)
+        try commitMessage.write(to: messageURL, atomically: true, encoding: .utf8)
+        defer {
+            try? FileManager.default.removeItem(at: messageURL)
+        }
+
         _ = try runCommand(
-            "git commit -m \(Shell.quote("chore: codex auto-fix for PR #\(pr.number)"))",
+            "git commit --no-verify -F \(Shell.quote(messageURL.path))",
             currentDirectory: repoPath,
             failOnNonZeroExit: true,
             monthlyFixTracker: monthlyFixTracker,
@@ -772,6 +788,165 @@ public final class WorkflowRunner {
             commandLog: commandLog
         )
         return true
+    }
+
+    private struct ReviewFinding {
+        let issueLevel: Int
+        let title: String
+    }
+
+    private func parseReviewFindings(fromText text: String) -> [ReviewFinding] {
+        var findings: [ReviewFinding] = []
+        for raw in text.split(whereSeparator: \.isNewline) {
+            let line = String(raw).trimmingCharacters(in: .whitespacesAndNewlines)
+            guard line.hasPrefix("- [") else {
+                continue
+            }
+
+            let bracketed = String(line.dropFirst(2))
+            guard bracketed.hasPrefix("["),
+                  let closeIndex = bracketed.firstIndex(of: "]") else {
+                continue
+            }
+
+            let levelToken = String(bracketed[bracketed.index(after: bracketed.startIndex) ..< closeIndex])
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .uppercased()
+            guard levelToken.count == 2,
+                  levelToken.hasPrefix("P"),
+                  let digit = levelToken.last?.wholeNumberValue,
+                  (0...3).contains(digit) else {
+                continue
+            }
+
+            let afterBracket = String(bracketed[bracketed.index(after: closeIndex)...])
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !afterBracket.isEmpty else {
+                continue
+            }
+
+            let titlePart = afterBracket.components(separatedBy: "—").first ?? afterBracket
+            let normalized = titlePart
+                .split(whereSeparator: \.isWhitespace)
+                .joined(separator: " ")
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .trimmingCharacters(in: CharacterSet(charactersIn: "."))
+            guard !normalized.isEmpty else {
+                continue
+            }
+
+            findings.append(ReviewFinding(issueLevel: digit, title: normalized))
+        }
+        return findings
+    }
+
+    private func highestIssueLevel(from findings: [ReviewFinding]) -> String {
+        guard let level = findings.map(\.issueLevel).min() else {
+            return "Unknown"
+        }
+        return "P\(level)"
+    }
+
+    private func inferIssueLevel(fromText text: String) -> String {
+        let findings = parseReviewFindings(fromText: text)
+        if !findings.isEmpty {
+            return highestIssueLevel(from: findings)
+        }
+
+        let tokens = text.split { !$0.isLetter && !$0.isNumber }.map { $0.lowercased() }
+        var bestPriority: Int?
+        var hasCritical = false
+        var hasHigh = false
+        var hasMedium = false
+        var hasLow = false
+
+        for token in tokens {
+            if token.count == 2, token.hasPrefix("p"), let value = Int(token.suffix(1)), (0...3).contains(value) {
+                bestPriority = min(bestPriority ?? value, value)
+                continue
+            }
+
+            switch token {
+            case "critical", "blocker", "sev1", "severity1":
+                hasCritical = true
+            case "high", "sev2", "severity2":
+                hasHigh = true
+            case "medium", "med", "sev3", "severity3":
+                hasMedium = true
+            case "low", "minor", "sev4", "severity4":
+                hasLow = true
+            default:
+                break
+            }
+        }
+
+        if let bestPriority {
+            return "P\(bestPriority)"
+        }
+        if hasCritical {
+            return "P0"
+        }
+        if hasHigh {
+            return "P1"
+        }
+        if hasMedium {
+            return "P2"
+        }
+        if hasLow {
+            return "P3"
+        }
+        return "Unknown"
+    }
+
+    private func summarizeFromFindings(_ findings: [ReviewFinding]) -> String? {
+        guard !findings.isEmpty else {
+            return nil
+        }
+
+        let titles = findings.prefix(2).map(\.title).filter { !$0.isEmpty }
+        guard !titles.isEmpty else {
+            return nil
+        }
+
+        if findings.count == 1 {
+            return "Apply review suggestion: \(titles[0])."
+        }
+        if findings.count == 2 {
+            return "Apply review suggestions: \(titles[0]); \(titles[1])."
+        }
+        return "Apply review suggestions: \(titles[0]); \(titles[1]) (+\(findings.count - 2) more)."
+    }
+
+    private func deriveCommitContext(fromReportPath reportPath: String) -> (summary: String, issueLevel: String) {
+        let defaultSummary = "Apply automated fixes based on review findings."
+
+        guard let content = try? String(contentsOfFile: reportPath, encoding: .utf8) else {
+            return (defaultSummary, "Unknown")
+        }
+
+        let findings = parseReviewFindings(fromText: content)
+        if !findings.isEmpty {
+            let issueLevel = highestIssueLevel(from: findings)
+            let summary = summarizeFromFindings(findings) ?? defaultSummary
+            return (summary, issueLevel)
+        }
+
+        let issueLevel = inferIssueLevel(fromText: content)
+        return (defaultSummary, issueLevel)
+    }
+
+    private func formatSummaryWithLevel(issueLevel: String, summary: String) -> String {
+        let levelTag = issueLevel.hasPrefix("P") ? issueLevel : "Pn"
+        return "[\(levelTag)] \(summary)"
+    }
+
+    private func buildCommitMessage(prNumber: Int, issueLevel: String, summary: String) -> String {
+        var lines: [String] = []
+        lines.append("chore: auto-fix for PR #\(prNumber)")
+        lines.append("")
+        lines.append("Summary: \(formatSummaryWithLevel(issueLevel: issueLevel, summary: summary))")
+        lines.append("")
+        return lines.joined(separator: "\n")
     }
 
     private func expand(

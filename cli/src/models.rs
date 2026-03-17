@@ -58,7 +58,7 @@ pub fn default_review_template() -> String {
 }
 
 pub fn default_fix_template() -> String {
-    "codex exec \"You are in a checked-out PR branch. Read findings and fix issues for PR #{{PR_NUMBER}} ({{PR_TITLE}}). Use report context at {{REPORT_PATH}} when relevant. Make minimal safe changes and update tests if needed.\"".to_string()
+    "codex exec -s workspace-write \"You are in a checked-out PR branch. Read findings and fix issues for PR #{{PR_NUMBER}} ({{PR_TITLE}}). Use report context at {{REPORT_PATH}} when relevant. Make minimal safe changes and update tests if needed.\"".to_string()
 }
 
 impl Default for AppSettings {

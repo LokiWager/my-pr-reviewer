@@ -42,7 +42,7 @@ You will enter an interactive prompt like:
 
 Available shell commands:
 - `run`: start workflow and print execution logs
-- `prs`: list open PRs (`new` / `processed`) and author name/login; PRs where current `gh` user already appears in `participants` are hidden
+- `prs`: list open PRs (`new` / `processed`) and author name/login; WIP PRs and PRs with commits by current `gh` user are hidden
 - `pick N`: choose PR by index from latest `prs` output and run review+fix+push
 - `run-pr X`: run review+fix+push for PR number `X`
 - `status`: show latest run status
@@ -111,7 +111,7 @@ PR_REVIEWER_HOME=/custom/path cargo run
   "max_command_retries": 2,
   "retry_delay_seconds": 15,
   "review_command_template": "codex review --base {{DEFAULT_BRANCH}}",
-  "fix_command_template": "codex exec \"You are in a checked-out PR branch. Read findings and fix issues for PR #{{PR_NUMBER}} ({{PR_TITLE}}). Use report context at {{REPORT_PATH}} when relevant. Make minimal safe changes and update tests if needed.\"",
+  "fix_command_template": "codex exec -s workspace-write \"You are in a checked-out PR branch. Read findings and fix issues for PR #{{PR_NUMBER}} ({{PR_TITLE}}). Use report context at {{REPORT_PATH}} when relevant. Make minimal safe changes and update tests if needed.\"",
   "auto_push_enabled": true
 }
 ```

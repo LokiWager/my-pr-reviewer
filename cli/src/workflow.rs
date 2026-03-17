@@ -152,6 +152,91 @@ where
     }
 }
 
+fn run_compact_bool_step<F>(
+    step: usize,
+    total: usize,
+    label: &str,
+    pr_number: u64,
+    action: F,
+) -> Result<bool>
+where
+    F: FnOnce() -> Result<bool>,
+{
+    let prefix = format!("[{step}/{total}] {label} PR #{pr_number}");
+    if !std::io::stdout().is_terminal() {
+        println!("{} {}", paint(&prefix, "1;34"), paint("⏳", "1;33"));
+        match action() {
+            Ok(true) => {
+                println!("{} {}", paint(&prefix, "1;34"), paint("✅", "1;32"));
+                Ok(true)
+            }
+            Ok(false) => {
+                println!(
+                    "{} {}",
+                    paint(&prefix, "1;34"),
+                    paint("skipped (no changes)", "1;33")
+                );
+                Ok(false)
+            }
+            Err(err) => {
+                println!(
+                    "{} {}",
+                    paint(&format!("[error] {prefix}"), "1;31"),
+                    paint("❌", "1;31")
+                );
+                print_compact_error(&err.to_string());
+                Err(err)
+            }
+        }
+    } else {
+        let running = Arc::new(AtomicBool::new(true));
+        let running_worker = Arc::clone(&running);
+        let spinner_prefix = paint(&prefix, "1;34");
+        let worker = thread::spawn(move || {
+            let frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+            let mut index = 0usize;
+            while running_worker.load(Ordering::Relaxed) {
+                let frame = paint(frames[index % frames.len()], "1;33");
+                print!("\r{} {}", spinner_prefix, frame);
+                let _ = std::io::stdout().flush();
+                index += 1;
+                thread::sleep(Duration::from_millis(100));
+            }
+        });
+
+        let result = action();
+        running.store(false, Ordering::Relaxed);
+        let _ = worker.join();
+
+        match result {
+            Ok(true) => {
+                print!("\r{} {}\n", paint(&prefix, "1;34"), paint("✅", "1;32"));
+                let _ = std::io::stdout().flush();
+                Ok(true)
+            }
+            Ok(false) => {
+                print!(
+                    "\r{} {}\n",
+                    paint(&prefix, "1;34"),
+                    paint("skipped (no changes)", "1;33")
+                );
+                let _ = std::io::stdout().flush();
+                Ok(false)
+            }
+            Err(err) => {
+                print!(
+                    "\r{} {}\n",
+                    paint(&format!("[error] {prefix}"), "1;31"),
+                    paint("❌", "1;31")
+                );
+                let _ = std::io::stdout().flush();
+                print_compact_error(&err.to_string());
+                Err(err)
+            }
+        }
+    }
+}
+
 fn log_step(snapshot: &mut RunSnapshot, message: impl AsRef<str>, verbose: bool) {
     let message = message.as_ref();
     append_log(snapshot, message);
@@ -441,17 +526,6 @@ fn value_contains_login(value: &serde_json::Value, login_lower: &str) -> bool {
     }
 }
 
-fn pr_involves_login(pr: &OpenPr, login_lower: &str) -> bool {
-    if pr.author.login.eq_ignore_ascii_case(login_lower) {
-        return true;
-    }
-    value_contains_login(&pr.assignees, login_lower)
-        || value_contains_login(&pr.reviews, login_lower)
-        || value_contains_login(&pr.review_requests, login_lower)
-        || value_contains_login(&pr.comments, login_lower)
-        || value_contains_login(&pr.latest_reviews, login_lower)
-}
-
 fn pr_has_commit_by_login(
     settings: &AppSettings,
     pr_number: u64,
@@ -489,11 +563,7 @@ pub fn print_pr_list(paths: &StorePaths, sync: bool) -> Result<Vec<OpenPr>> {
         }
 
         let hide = if let Some(login) = &my_login {
-            if pr_involves_login(&pr, login) {
-                true
-            } else {
-                pr_has_commit_by_login(&settings, pr.number, login).unwrap_or(false)
-            }
+            pr_has_commit_by_login(&settings, pr.number, login).unwrap_or(false)
         } else {
             false
         };
@@ -504,7 +574,7 @@ pub fn print_pr_list(paths: &StorePaths, sync: bool) -> Result<Vec<OpenPr>> {
     }
 
     if filtered_prs.is_empty() {
-        println!("no open PRs to show (after participant filter)");
+        println!("no open PRs to show (after WIP/self-commit filter)");
         println!(
             "Calendar-month fixed PR count: {}",
             monthly_fixed_pr_count()
@@ -693,7 +763,7 @@ fn execute_pr(
             .map_err(|e| anyhow!(render_exec_error(&e)))
         };
         pushed = if compact_step_output {
-            run_compact_step(4, 4, "Commit", pr.number, commit_exec)?
+            run_compact_bool_step(4, 4, "Commit", pr.number, commit_exec)?
         } else {
             commit_exec()?
         };
